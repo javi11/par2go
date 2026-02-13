@@ -27,12 +27,12 @@ func main() {
 	outputPath := "/path/to/myfile.par2"
 	inputFiles := []string{"/path/to/myfile.bin"}
 
-	opts := par2creator.Options{
+	opts := par2go.Options{
 		SliceSize:   32768,  // 32 KB blocks (must be a multiple of 4)
 		NumRecovery: 5,      // number of recovery blocks
 	}
 
-	if err := par2creator.Create(ctx, outputPath, inputFiles, opts); err != nil {
+	if err := par2go.Create(ctx, outputPath, inputFiles, opts); err != nil {
 		log.Fatal(err)
 	}
 	// Creates myfile.par2 and volume files like myfile.vol00+01.par2, ...
@@ -55,7 +55,7 @@ func main() {
 Use `OnProgress` for UI or logging:
 
 ```go
-opts := par2creator.Options{
+opts := par2go.Options{
 	SliceSize:   32768,
 	NumRecovery: 5,
 	OnProgress: func(phase string, pct float64) {
@@ -70,7 +70,7 @@ Pass a cancellable context to stop creation early:
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
 // call cancel() to abort
-err := par2creator.Create(ctx, outputPath, inputFiles, opts)
+err := par2go.Create(ctx, outputPath, inputFiles, opts)
 ```
 
 ## Multiple input files
@@ -83,7 +83,7 @@ inputFiles := []string{
 	"/path/to/file2.bin",
 	"/path/to/file3.bin",
 }
-err := par2creator.Create(ctx, "/path/to/set.par2", inputFiles, opts)
+err := par2go.Create(ctx, "/path/to/set.par2", inputFiles, opts)
 ```
 
 ## Output files

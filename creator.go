@@ -1,8 +1,8 @@
-// Package par2creator implements a pure Go PAR2 parity file creator.
+// Package par2go implements a pure Go PAR2 parity file creator.
 //
 // It creates PAR2 recovery files compatible with par2cmdline, MultiPar, and
 // other PAR2-compliant tools, without requiring any external binaries.
-package par2creator
+package par2go
 
 import (
 	"bytes"
@@ -80,13 +80,13 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	opts = opts.withDefaults()
 
 	if opts.SliceSize <= 0 || opts.SliceSize%4 != 0 {
-		return fmt.Errorf("par2creator: SliceSize must be a positive multiple of 4, got %d", opts.SliceSize)
+		return fmt.Errorf("par2go: SliceSize must be a positive multiple of 4, got %d", opts.SliceSize)
 	}
 	if opts.NumRecovery <= 0 {
-		return fmt.Errorf("par2creator: NumRecovery must be positive, got %d", opts.NumRecovery)
+		return fmt.Errorf("par2go: NumRecovery must be positive, got %d", opts.NumRecovery)
 	}
 	if len(inputFiles) == 0 {
-		return fmt.Errorf("par2creator: no input files")
+		return fmt.Errorf("par2go: no input files")
 	}
 
 	report := func(phase string, pct float64) {
@@ -96,14 +96,14 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	}
 
 	// Phase 1: Hash input files and compute per-slice checksums
-	slog.Debug("par2creator: hashing input files", "count", len(inputFiles))
+	slog.Debug("par2go: hashing input files", "count", len(inputFiles))
 	report("hashing", 0)
 
 	files, err := hashFiles(ctx, inputFiles, opts.SliceSize, func(pct float64) {
 		report("hashing", pct)
 	})
 	if err != nil {
-		return fmt.Errorf("par2creator: hashing failed: %w", err)
+		return fmt.Errorf("par2go: hashing failed: %w", err)
 	}
 
 	report("hashing", 1.0)
@@ -123,7 +123,7 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	recoverySetID := packets.RecoverySetID(mainBody)
 
 	// Phase 3: RS encode recovery blocks
-	slog.Debug("par2creator: encoding recovery blocks",
+	slog.Debug("par2go: encoding recovery blocks",
 		"numRecovery", opts.NumRecovery,
 		"sliceSize", opts.SliceSize)
 
@@ -142,7 +142,7 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 
 	totalInputSlices := len(allSlices)
 	if totalInputSlices == 0 {
-		return fmt.Errorf("par2creator: no input slices (all files empty?)")
+		return fmt.Errorf("par2go: no input slices (all files empty?)")
 	}
 
 	enc := rsenc.NewEncoder(opts.SliceSize, opts.NumRecovery)
@@ -161,7 +161,7 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 			for j := 0; j < i; j++ {
 				_ = openFiles[j].Close()
 			}
-			return fmt.Errorf("par2creator: open %s: %w", fi.path, err)
+			return fmt.Errorf("par2go: open %s: %w", fi.path, err)
 		}
 		openFiles[i] = f
 	}
@@ -208,27 +208,27 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("par2creator: encoding failed: %w", err)
+		return fmt.Errorf("par2go: encoding failed: %w", err)
 	}
 
 	report("encoding", 1.0)
 
 	// Phase 4: Write output files
-	slog.Debug("par2creator: writing PAR2 files", "output", outputPath)
+	slog.Debug("par2go: writing PAR2 files", "output", outputPath)
 	report("writing", 0)
 
 	// 4a: Write main .par2 file (no recovery data, just metadata packets)
 	if err := writeMainFile(outputPath, recoverySetID, mainBody, files, opts.Creator); err != nil {
-		return fmt.Errorf("par2creator: writing main file failed: %w", err)
+		return fmt.Errorf("par2go: writing main file failed: %w", err)
 	}
 
 	// 4b: Write volume files with doubling strategy
 	if err := writeVolumeFiles(outputPath, recoverySetID, recoveryBlocks, opts.SliceSize); err != nil {
-		return fmt.Errorf("par2creator: writing volume files failed: %w", err)
+		return fmt.Errorf("par2go: writing volume files failed: %w", err)
 	}
 
 	report("writing", 1.0)
-	slog.Debug("par2creator: done")
+	slog.Debug("par2go: done")
 
 	return nil
 }

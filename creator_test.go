@@ -1,4 +1,4 @@
-package par2creator
+package par2go
 
 import (
 	"bytes"
