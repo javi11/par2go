@@ -10,17 +10,11 @@ go get github.com/javi11/par2go
 
 Requires **Go 1.26** or later.
 
-### CGO-accelerated backend (recommended)
+### SIMD-accelerated encoding
 
-By default par2go links a pre-built [ParPar](https://github.com/animetosho/ParPar) GF(2^16) static library that provides SIMD-optimized Reed-Solomon encoding (SSE2, AVX2, AVX-512, NEON, SVE2, etc. with runtime CPU detection). This requires a C compiler at build time:
+par2go uses pre-built [ParPar](https://github.com/animetosho/ParPar) static libraries for SIMD-optimized Reed-Solomon encoding (SSE2, AVX2, AVX-512, NEON, SVE2, etc. with runtime CPU detection). The static libraries are committed to the repo, so no C++ compiler is needed.
 
-| Platform | Requirement |
-|----------|-------------|
-| macOS | Xcode Command Line Tools (`xcode-select --install`) |
-| Linux | GCC or Clang (`apt install build-essential` / `dnf install gcc gcc-c++`) |
-| Windows | [MSYS2](https://www.msys2.org/) MinGW-w64 toolchain (`pacman -S mingw-w64-x86_64-gcc`) |
-
-No C++ compiler is needed — the static libraries are pre-built and committed. Only a C linker (the default `cc` / `gcc`) is required by CGO.
+CGO must be enabled (the default). On **Windows**, a MinGW-w64 toolchain is required for linking — install via [MSYS2](https://www.msys2.org/): `pacman -S mingw-w64-x86_64-gcc`.
 
 ## Quick start
 
