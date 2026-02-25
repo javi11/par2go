@@ -4,14 +4,21 @@ GO ?= go
 
 .PHONY: parpar
 parpar:
-	$(MAKE) -C internal/parpar libparpar_gf16.a
+	$(MAKE) -C internal/parpar native
+
+.PHONY: parpar-all
+parpar-all:
+	$(MAKE) -C internal/parpar darwin
+	$(MAKE) -C internal/parpar linux/amd64
+	$(MAKE) -C internal/parpar linux/arm64
+	$(MAKE) -C internal/parpar windows/amd64
 
 .PHONY: clean-parpar
 clean-parpar:
 	$(MAKE) -C internal/parpar clean
 
 .PHONY: generate
-generate: parpar
+generate:
 	go generate ./...
 
 .PHONY: govulncheck
@@ -63,7 +70,7 @@ test:
 	$(GO) test $(ARGS) ./...
 
 .PHONY: check
-check: generate go-mod-tidy golangci-lint test-race
+check: go-mod-tidy golangci-lint test-race
 
 .PHONY: git-hooks
 git-hooks:

@@ -16,20 +16,9 @@ GF16DIR := $(VENDOR)/gf16
 SRCDIR  := $(VENDOR)/src
 BUILDDIR := build
 
-# Architecture detection
+# Architecture detection (overridable for cross-compilation)
 UNAME_M := $(shell uname -m)
-
-ifeq ($(UNAME_M),x86_64)
-  ARCH := x86_64
-else ifeq ($(UNAME_M),amd64)
-  ARCH := x86_64
-else ifeq ($(UNAME_M),aarch64)
-  ARCH := aarch64
-else ifeq ($(UNAME_M),arm64)
-  ARCH := aarch64
-else
-  ARCH := generic
-endif
+ARCH ?= $(if $(filter x86_64 amd64,$(UNAME_M)),x86_64,$(if $(filter aarch64 arm64,$(UNAME_M)),aarch64,generic))
 
 # Common flags
 # -fPIC is needed on Unix for position-independent code; on Windows (MinGW) it's
@@ -341,6 +330,52 @@ $(BUILDDIR)/wrapper.cpp.o: wrapper.cpp | $(BUILDDIR)/gf16
 # ============================================================================
 # Housekeeping
 # ============================================================================
+
+# ============================================================================
+# Platform targets (for pre-building committed .a files)
+# ============================================================================
+
+# Build for the current platform and copy to the native-named output
+.PHONY: native
+native: libparpar_gf16.a
+ifeq ($(shell uname -s),Darwin)
+	cp libparpar_gf16.a libparpar_gf16_darwin.a
+else ifeq ($(shell uname -s),Linux)
+  ifeq ($(ARCH),x86_64)
+	cp libparpar_gf16.a libparpar_gf16_linux_amd64.a
+  else
+	cp libparpar_gf16.a libparpar_gf16_linux_arm64.a
+  endif
+else
+	cp libparpar_gf16.a libparpar_gf16_windows_amd64.a
+endif
+
+# macOS universal binary (amd64 + arm64)
+.PHONY: darwin
+darwin:
+	$(MAKE) clean
+	$(MAKE) ARCH=x86_64 CC="cc -target x86_64-apple-macos11" CXX="c++ -target x86_64-apple-macos11" libparpar_gf16.a
+	mv libparpar_gf16.a libparpar_gf16_x86_64.a
+	$(MAKE) clean
+	$(MAKE) ARCH=aarch64 libparpar_gf16.a
+	mv libparpar_gf16.a libparpar_gf16_arm64.a
+	lipo -create libparpar_gf16_x86_64.a libparpar_gf16_arm64.a -output libparpar_gf16_darwin.a
+	rm -f libparpar_gf16_x86_64.a libparpar_gf16_arm64.a
+
+# Linux amd64 (run on ubuntu-latest)
+.PHONY: linux/amd64
+linux/amd64: libparpar_gf16.a
+	cp libparpar_gf16.a libparpar_gf16_linux_amd64.a
+
+# Linux arm64 (run on ubuntu-24.04-arm)
+.PHONY: linux/arm64
+linux/arm64: libparpar_gf16.a
+	cp libparpar_gf16.a libparpar_gf16_linux_arm64.a
+
+# Windows amd64 (run on windows-latest with MSYS2/MinGW)
+.PHONY: windows/amd64
+windows/amd64: libparpar_gf16.a
+	cp libparpar_gf16.a libparpar_gf16_windows_amd64.a
 
 .PHONY: clean
 clean:

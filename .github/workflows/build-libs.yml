@@ -1,0 +1,104 @@
+name: Build ParPar Static Libraries
+
+on:
+  push:
+    paths:
+      - 'internal/parpar/vendor/**'
+      - 'internal/parpar/wrapper.*'
+      - 'internal/parpar/Makefile'
+
+permissions:
+  contents: write
+
+jobs:
+  darwin:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build universal binary (amd64 + arm64)
+        run: make -C internal/parpar darwin
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libparpar_gf16_darwin
+          path: internal/parpar/libparpar_gf16_darwin.a
+
+  linux-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: make -C internal/parpar linux/amd64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libparpar_gf16_linux_amd64
+          path: internal/parpar/libparpar_gf16_linux_amd64.a
+
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: make -C internal/parpar linux/arm64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libparpar_gf16_linux_arm64
+          path: internal/parpar/libparpar_gf16_linux_arm64.a
+
+  windows-amd64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc make
+
+      - name: Build
+        shell: msys2 {0}
+        run: make -C internal/parpar windows/amd64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libparpar_gf16_windows_amd64
+          path: internal/parpar/libparpar_gf16_windows_amd64.a
+
+  commit:
+    needs: [darwin, linux-amd64, linux-arm64, windows-amd64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: internal/parpar
+          merge-multiple: true
+
+      - name: Commit updated libraries
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add internal/parpar/libparpar_gf16_*.a
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "build: update pre-built ParPar static libraries"
+            git push
+          fi

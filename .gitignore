@@ -25,6 +25,6 @@ go.work.sum
 .env
 .tools
 
-# ParPar build artifacts
+# ParPar build artifacts (pre-built .a files are committed)
 internal/parpar/build/
 internal/parpar/libparpar_gf16.a

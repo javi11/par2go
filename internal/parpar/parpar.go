@@ -3,15 +3,17 @@
 // (SSE2, SSSE3, AVX, AVX2, AVX-512, GFNI, NEON, SVE, CLMul, RISC-V, etc.)
 // with runtime CPU detection and automatic dispatch.
 //
-// Build the static library first: make -C internal/parpar libparpar_gf16.a
+// Pre-built static libraries are committed per platform (see build-libs.yml).
+// To rebuild from source: make -C internal/parpar libparpar_gf16.a
 package parpar
-
-//go:generate make -C . libparpar_gf16.a
 
 /*
 #cgo CFLAGS: -I${SRCDIR} -DPARPAR_INVERT_SUPPORT -DPARPAR_SLIM_GF16
 #cgo CXXFLAGS: -I${SRCDIR} -I${SRCDIR}/vendor -DPARPAR_INVERT_SUPPORT -DPARPAR_SLIM_GF16
-#cgo LDFLAGS: -L${SRCDIR} -lparpar_gf16 -lstdc++ -lm
+#cgo darwin LDFLAGS: ${SRCDIR}/libparpar_gf16_darwin.a -lstdc++ -lm
+#cgo linux,amd64 LDFLAGS: ${SRCDIR}/libparpar_gf16_linux_amd64.a -lstdc++ -lm
+#cgo linux,arm64 LDFLAGS: ${SRCDIR}/libparpar_gf16_linux_arm64.a -lstdc++ -lm
+#cgo windows,amd64 LDFLAGS: ${SRCDIR}/libparpar_gf16_windows_amd64.a -lstdc++ -lm
 #include "wrapper.h"
 #include <stdlib.h>
 #include <string.h>

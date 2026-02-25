@@ -21,9 +21,6 @@ jobs:
         with:
           go-version: stable
 
-      - name: Build ParPar static library
-        run: make -C internal/parpar libparpar_gf16.a
-
       - name: Tidy
         run: |
           go mod tidy
@@ -69,27 +66,12 @@ jobs:
         with:
           go-version: stable
 
-      - name: Cache ParPar static library
-        uses: actions/cache@v4
-        with:
-          path: internal/parpar/libparpar_gf16.a
-          key: parpar-${{ matrix.name }}-${{ hashFiles('internal/parpar/Makefile', 'internal/parpar/vendor/**', 'internal/parpar/wrapper.*') }}
-
       - name: Set up MSYS2
         if: matrix.os == 'windows'
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          install: mingw-w64-x86_64-gcc make
-
-      - name: Build ParPar static library (Unix)
-        if: matrix.os != 'windows'
-        run: make -C internal/parpar libparpar_gf16.a
-
-      - name: Build ParPar static library (Windows)
-        if: matrix.os == 'windows'
-        shell: msys2 {0}
-        run: make -C internal/parpar libparpar_gf16.a
+          install: mingw-w64-x86_64-gcc
 
       - name: Add MinGW to PATH
         if: matrix.os == 'windows'
