@@ -127,7 +127,7 @@ RVV_ZVBC_FLAGS := $(call check_flag,$(CC),-march=rv64gcv_zvbc1)
 # C++ sources
 CXX_SRCS := \
 	$(GF16DIR)/gf16mul.cpp \
-	wrapper.cpp
+	csrc/wrapper.cpp
 
 # ============================================================================
 # Build architecture-specific object lists
@@ -324,8 +324,8 @@ $(BUILDDIR)/gf16/gf16_clmul_rvv.c.o: $(GF16DIR)/gf16_clmul_rvv.c | $(BUILDDIR)/g
 $(BUILDDIR)/gf16mul.cpp.o: $(GF16DIR)/gf16mul.cpp | $(BUILDDIR)/gf16
 	$(CXX) $(CXXFLAGS_COMMON) $(DEFINES) -c -o $@ $<
 
-$(BUILDDIR)/wrapper.cpp.o: wrapper.cpp | $(BUILDDIR)/gf16
-	$(CXX) $(CXXFLAGS_COMMON) $(DEFINES) -c -o $@ $<
+$(BUILDDIR)/wrapper.cpp.o: csrc/wrapper.cpp | $(BUILDDIR)/gf16
+	$(CXX) $(CXXFLAGS_COMMON) $(DEFINES) -I. -c -o $@ $<
 
 # ============================================================================
 # Housekeeping

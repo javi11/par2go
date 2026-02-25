@@ -8,8 +8,6 @@
 package parpar
 
 /*
-#cgo CFLAGS: -I${SRCDIR} -DPARPAR_INVERT_SUPPORT -DPARPAR_SLIM_GF16
-#cgo CXXFLAGS: -I${SRCDIR} -I${SRCDIR}/vendor -DPARPAR_INVERT_SUPPORT -DPARPAR_SLIM_GF16
 #cgo darwin LDFLAGS: ${SRCDIR}/libparpar_gf16_darwin.a -lstdc++ -lm
 #cgo linux,amd64 LDFLAGS: ${SRCDIR}/libparpar_gf16_linux_amd64.a -lstdc++ -lm
 #cgo linux,arm64 LDFLAGS: ${SRCDIR}/libparpar_gf16_linux_arm64.a -lstdc++ -lm
