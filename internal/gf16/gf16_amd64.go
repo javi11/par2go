@@ -1,4 +1,4 @@
-//go:build amd64
+//go:build amd64 && (!cgo || purego)
 
 package gf16
 

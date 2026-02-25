@@ -2,8 +2,16 @@ GO ?= go
 
 .DEFAULT_GOAL := check
 
+.PHONY: parpar
+parpar:
+	$(MAKE) -C internal/parpar libparpar_gf16.a
+
+.PHONY: clean-parpar
+clean-parpar:
+	$(MAKE) -C internal/parpar clean
+
 .PHONY: generate
-generate:
+generate: parpar
 	go generate ./...
 
 .PHONY: govulncheck
