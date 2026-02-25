@@ -17,7 +17,17 @@ parpar_gf16_t* parpar_gf16_new(int method) {
     parpar_gf16_t* gf = new(std::nothrow) parpar_gf16_t;
     if (!gf) return NULL;
 
-    gf->mul = new(std::nothrow) Galois16Mul(static_cast<Galois16Methods>(method));
+    Galois16Methods m = static_cast<Galois16Methods>(method);
+    if (m == GF16_AUTO) {
+        // Use forInvert=true to avoid XOR-JIT methods which require
+        // aligned buffers and writable-executable memory. Since Go
+        // allocates buffers with its own allocator (not aligned to SIMD
+        // requirements), non-JIT methods (Shuffle, Affine, CLMul) are
+        // more compatible and still fast.
+        m = Galois16Mul::default_method(1048576, 32768, 65535, true);
+    }
+
+    gf->mul = new(std::nothrow) Galois16Mul(m);
     if (!gf->mul) {
         delete gf;
         return NULL;

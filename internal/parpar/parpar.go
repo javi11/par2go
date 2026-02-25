@@ -14,6 +14,7 @@ package parpar
 #cgo LDFLAGS: -L${SRCDIR} -lparpar_gf16 -lstdc++ -lm
 #include "wrapper.h"
 #include <stdlib.h>
+#include <string.h>
 */
 import "C"
 
@@ -100,17 +101,20 @@ func (s *Scratch) Free() {
 //
 // For best performance:
 //   - len(dst) == len(src) and both should be multiples of Stride()
-//   - buffers should be aligned to Alignment()
+//   - use AlignedSlice to allocate buffers with correct SIMD alignment
 //   - use a per-goroutine Scratch (from a sync.Pool)
 //
 // The function handles unaligned/non-stride-multiple lengths by processing
 // the aligned prefix via ParPar SIMD and the remainder with a Go scalar fallback.
+// If buffers are not SIMD-aligned, the function copies through aligned
+// temporaries transparently (at some performance cost for large buffers).
 func (gf *GF16) MulAdd(dst, src []byte, coefficient uint16, scratch *Scratch) {
 	if len(src) == 0 || coefficient == 0 {
 		return
 	}
 
 	stride := gf.Stride()
+	alignment := gf.Alignment()
 	n := len(src)
 	aligned := n - (n % stride)
 
@@ -120,14 +124,42 @@ func (gf *GF16) MulAdd(dst, src []byte, coefficient uint16, scratch *Scratch) {
 	}
 
 	if aligned > 0 {
-		C.parpar_gf16_muladd(
-			gf.handle,
-			unsafe.Pointer(&dst[0]),
-			unsafe.Pointer(&src[0]),
-			C.size_t(aligned),
-			C.uint16_t(coefficient),
-			scratchPtr,
-		)
+		dstPtr := unsafe.Pointer(&dst[0])
+		srcPtr := unsafe.Pointer(&src[0])
+
+		// Check if buffers meet SIMD alignment requirements.
+		dstAligned := uintptr(dstPtr)%uintptr(alignment) == 0
+		srcAligned := uintptr(srcPtr)%uintptr(alignment) == 0
+
+		if dstAligned && srcAligned {
+			// Fast path: buffers are already aligned.
+			C.parpar_gf16_muladd(
+				gf.handle, dstPtr, srcPtr,
+				C.size_t(aligned), C.uint16_t(coefficient), scratchPtr,
+			)
+		} else {
+			// Slow path: copy through aligned temporaries.
+			alignedSrc := C.parpar_aligned_alloc(C.size_t(alignment), C.size_t(aligned))
+			alignedDst := C.parpar_aligned_alloc(C.size_t(alignment), C.size_t(aligned))
+			if alignedSrc != nil && alignedDst != nil {
+				C.memcpy(alignedSrc, srcPtr, C.size_t(aligned))
+				C.memcpy(alignedDst, dstPtr, C.size_t(aligned))
+				C.parpar_gf16_muladd(
+					gf.handle, alignedDst, alignedSrc,
+					C.size_t(aligned), C.uint16_t(coefficient), scratchPtr,
+				)
+				C.memcpy(dstPtr, alignedDst, C.size_t(aligned))
+			} else {
+				// Allocation failed; fall through to scalar tail.
+				aligned = 0
+			}
+			if alignedSrc != nil {
+				C.parpar_aligned_free(alignedSrc)
+			}
+			if alignedDst != nil {
+				C.parpar_aligned_free(alignedDst)
+			}
+		}
 	}
 
 	// Handle remainder with scalar Go code
@@ -177,6 +209,27 @@ func buildTables() {
 		if val&0x10000 != 0 {
 			val ^= gf16Polynomial
 		}
+	}
+}
+
+// AlignedSlice allocates a byte slice of the given size with memory aligned
+// to the SIMD requirements of this GF16 instance. Using aligned slices with
+// MulAdd avoids the overhead of copying through aligned temporaries.
+// The returned slice must be freed with FreeAligned when no longer needed.
+func (gf *GF16) AlignedSlice(size int) []byte {
+	alignment := gf.Alignment()
+	ptr := C.parpar_aligned_alloc(C.size_t(alignment), C.size_t(size))
+	if ptr == nil {
+		return nil
+	}
+	C.memset(ptr, 0, C.size_t(size))
+	return unsafe.Slice((*byte)(ptr), size)
+}
+
+// FreeAligned frees a slice previously allocated with AlignedSlice.
+func FreeAligned(b []byte) {
+	if len(b) > 0 {
+		C.parpar_aligned_free(unsafe.Pointer(&b[0]))
 	}
 }
 
