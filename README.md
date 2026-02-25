@@ -20,23 +20,7 @@ By default par2go links a pre-built [ParPar](https://github.com/animetosho/ParPa
 | Linux | GCC or Clang (`apt install build-essential` / `dnf install gcc gcc-c++`) |
 | Windows | [MSYS2](https://www.msys2.org/) MinGW-w64 toolchain (`pacman -S mingw-w64-x86_64-gcc`) |
 
-No C++ compiler is needed — the static libraries are pre-built and committed. Only a C linker (the default `cc` / `gcc`) is required by CGo.
-
-### Pure-Go fallback
-
-To build without CGO (no C compiler needed), disable it:
-
-```bash
-CGO_ENABLED=0 go build ./...
-```
-
-Or use the `purego` build tag:
-
-```bash
-go build -tags purego ./...
-```
-
-The pure-Go backend uses lookup-table-based GF(2^16) arithmetic. It is fully functional but slower than the SIMD path.
+No C++ compiler is needed — the static libraries are pre-built and committed. Only a C linker (the default `cc` / `gcc`) is required by CGO.
 
 ## Quick start
 

@@ -3,8 +3,8 @@
 // The field is GF(2^16) with the irreducible polynomial x^16 + x^12 + x^3 + x + 1
 // (0x1100B in hex). All arithmetic operations are performed in this field.
 //
-// The hot path — MulAccumulate — dispatches to SIMD implementations on supported
-// platforms (AVX2/SSSE3 on amd64, NEON on arm64) with a pure Go fallback.
+// The hot path — MulAccumulate — dispatches to ParPar's SIMD-optimized backends
+// (SSE2, AVX2, AVX-512, NEON, SVE2, etc.) via CGO with runtime CPU detection.
 package gf16
 
 // Field polynomial: x^16 + x^12 + x^3 + x + 1 = 0x1100B
@@ -89,8 +89,8 @@ func Inv(a uint16) uint16 {
 // multiplication is in GF(2^16). src and dst are treated as slices of
 // little-endian uint16 values, so len must be even.
 //
-// This is the hot path for RS encoding. On supported platforms it dispatches
-// to SIMD (AVX2/SSSE3/NEON); otherwise it falls back to pure Go.
+// This is the hot path for RS encoding. It dispatches to ParPar's
+// SIMD-optimized backends via CGO.
 func MulAccumulate(dst, src []byte, factor uint16) {
 	if factor == 0 {
 		return
@@ -111,12 +111,6 @@ func MulAccumulate(dst, src []byte, factor uint16) {
 		return
 	}
 
-	if useSIMD {
-		tables := BuildMulAccTables(factor)
-		mulAccumulateSIMD(dst, src, &tables)
-		return
-	}
-
 	mulAccumulate(dst, src, factor)
 }
 
@@ -126,7 +120,6 @@ func xorBytes(dst, src []byte) {
 	n := len(src)
 	i := 0
 	for ; i+8 <= n; i += 8 {
-		// Unrolled XOR
 		dst[i] ^= src[i]
 		dst[i+1] ^= src[i+1]
 		dst[i+2] ^= src[i+2]
@@ -139,37 +132,4 @@ func xorBytes(dst, src []byte) {
 	for ; i < n; i++ {
 		dst[i] ^= src[i]
 	}
-}
-
-// MulAccTables holds precomputed PSHUFB lookup tables for a given factor.
-// 8 tables × 16 bytes = 128 bytes total.
-// tables[0..3] = low result byte contribution for nibble positions 0-3
-// tables[4..7] = high result byte contribution for nibble positions 0-3
-type MulAccTables [8][16]byte
-
-// BuildMulAccTables precomputes split-table lookups for factor f.
-// Each GF(2^16) element is 2 bytes = 4 nibbles. For each nibble position,
-// we precompute the low and high byte of the product for all 16 nibble values.
-// This enables PSHUFB/VTBL-based parallel lookups in SIMD code.
-func BuildMulAccTables(f uint16) MulAccTables {
-	var t MulAccTables
-	for nibPos := range 4 {
-		for nibVal := range 16 {
-			element := uint16(nibVal) << (4 * nibPos)
-			product := Mul(element, f)
-			t[nibPos][nibVal] = byte(product)        // low byte
-			t[nibPos+4][nibVal] = byte(product >> 8) // high byte
-		}
-	}
-	return t
-}
-
-// LogTable returns the log table for use by SIMD implementations.
-func LogTable() *[65536]uint16 {
-	return &logTable
-}
-
-// ExpTable returns the exp table for use by SIMD implementations.
-func ExpTable() *[2 * 65535]uint16 {
-	return &expTable
 }

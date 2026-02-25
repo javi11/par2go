@@ -234,26 +234,6 @@ func BenchmarkMulAccumulate(b *testing.B) {
 	}
 }
 
-func BenchmarkMulAccumulateScalar(b *testing.B) {
-	// Benchmark the pure Go scalar path for comparison
-	sizes := []int{1024, 4096, 65536, 1 << 20}
-	for _, size := range sizes {
-		b.Run(byteSizeName(size), func(b *testing.B) {
-			src := make([]byte, size)
-			dst := make([]byte, size)
-			for i := range src {
-				src[i] = byte(i)
-			}
-			factor := uint16(42)
-			b.SetBytes(int64(size))
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				mulAccumulate(dst, src, factor)
-			}
-		})
-	}
-}
-
 func TestMulAccumulateLargeBuffer(t *testing.T) {
 	// Test with a PAR2-realistic buffer size (768KB slice size)
 	size := 768 * 1024

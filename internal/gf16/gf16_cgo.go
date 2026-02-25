@@ -1,5 +1,3 @@
-//go:build cgo && !purego
-
 package gf16
 
 import (
@@ -8,14 +6,8 @@ import (
 	"github.com/javi11/par2go/internal/parpar"
 )
 
-// When cgo is available, we use ParPar's optimized SIMD backends for
-// MulAccumulate instead of our hand-written assembly. ParPar handles its
-// own CPU detection and method dispatch across 33+ SIMD variants.
-
-var useSIMD = false // ParPar dispatches internally; we bypass the old SIMD path
-
-// mulAccumulateSIMD is unused in the cgo path but required by gf16.go's dispatch.
-func mulAccumulateSIMD(_, _ []byte, _ *MulAccTables) {}
+// MulAccumulate routes through ParPar's optimized SIMD backends which handle
+// CPU detection and method dispatch across 33+ SIMD variants.
 
 var (
 	gf16Once    sync.Once
@@ -34,7 +26,7 @@ func initParPar() {
 	}
 }
 
-// mulAccumulate routes through ParPar's SIMD-optimized GF(2^16) multiply-accumulate.
+// mulAccumulate delegates to ParPar's SIMD-optimized GF(2^16) multiply-accumulate.
 func mulAccumulate(dst, src []byte, factor uint16) {
 	gf16Once.Do(initParPar)
 	s := scratchPool.Get().(*parpar.Scratch)
