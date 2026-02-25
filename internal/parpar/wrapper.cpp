@@ -66,14 +66,70 @@ void parpar_gf16_scratch_free(parpar_gf16_t* gf, void* scratch) {
     gf->mul->mutScratch_free(scratch);
 }
 
+int parpar_gf16_needs_prepare(parpar_gf16_t* gf) {
+    if (!gf || !gf->mul) return 0;
+    return gf->mul->needPrepare() ? 1 : 0;
+}
+
 void parpar_gf16_muladd(parpar_gf16_t* gf, void* dst, const void* src,
                          size_t len, uint16_t coefficient, void* scratch) {
     if (!gf || !gf->mul || len == 0) return;
     if (coefficient == 0) return;
 
-    // Use the _mul_add function pointer through the public mul_add method.
-    // Note: mul_add requires PARPAR_INVERT_SUPPORT to be defined.
+    if (!gf->mul->needPrepare()) {
+        // Methods that don't need prepare (e.g. Lookup) work on raw data.
+        gf->mul->mul_add(dst, src, len, coefficient, scratch);
+        return;
+    }
+
+    // Methods like Shuffle and Affine operate on "prepared" (packed) data
+    // where high and low bytes of uint16 values are separated. We need to
+    // transform the data before mul_add and transform it back after.
+    size_t alignment = gf->mul->info().alignment;
+
+    void* prepSrc = NULL;
+    void* prepDst = NULL;
+    ALIGN_ALLOC(prepSrc, len, alignment);
+    ALIGN_ALLOC(prepDst, len, alignment);
+
+    if (!prepSrc || !prepDst) {
+        if (prepSrc) ALIGN_FREE(prepSrc);
+        if (prepDst) ALIGN_FREE(prepDst);
+        return;
+    }
+
+    // Convert to packed format (also copies to aligned buffers)
+    gf->mul->prepare(prepSrc, src, len);
+    gf->mul->prepare(prepDst, dst, len);
+
+    // Multiply-accumulate in packed format
+    gf->mul->mul_add(prepDst, prepSrc, len, coefficient, scratch);
+
+    // Convert back to natural format (in-place)
+    gf->mul->finish(prepDst, len);
+
+    // Copy result back
+    memcpy(dst, prepDst, len);
+
+    ALIGN_FREE(prepSrc);
+    ALIGN_FREE(prepDst);
+}
+
+void parpar_gf16_muladd_packed(parpar_gf16_t* gf, void* dst, const void* src,
+                                size_t len, uint16_t coefficient, void* scratch) {
+    if (!gf || !gf->mul || len == 0) return;
+    if (coefficient == 0) return;
     gf->mul->mul_add(dst, src, len, coefficient, scratch);
+}
+
+void parpar_gf16_prepare(parpar_gf16_t* gf, void* dst, const void* src, size_t len) {
+    if (!gf || !gf->mul || len == 0) return;
+    gf->mul->prepare(dst, src, len);
+}
+
+void parpar_gf16_finish(parpar_gf16_t* gf, void* dst, size_t len) {
+    if (!gf || !gf->mul || len == 0) return;
+    gf->mul->finish(dst, len);
 }
 
 void* parpar_aligned_alloc(size_t alignment, size_t size) {
