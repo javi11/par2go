@@ -32,6 +32,8 @@ else
 endif
 
 # Common flags
+# -fPIC is needed on Unix for position-independent code; on Windows (MinGW) it's
+# ignored but harmless. We keep it unconditionally for simplicity.
 CFLAGS_COMMON   := -O2 -fPIC -std=gnu99 -Wno-unused-function -I$(VENDOR)
 CXXFLAGS_COMMON := -O2 -fPIC -std=c++11 -Wno-unused-function -I$(VENDOR)
 
@@ -154,53 +156,34 @@ ALL_OBJS += $(CXX_OBJS)
 
 ifeq ($(ARCH),x86_64)
 
-# SSE2
-ifneq ($(SSE2_FLAGS),)
+# On x86_64, always compile ALL variant sources. When the compiler doesn't
+# support a flag set, the source files detect this via preprocessor checks
+# (e.g. __AVX2__, __GFNI__) and emit stub functions instead, which the
+# linker needs to resolve references in gf16mul.cpp.
+
 SSE2_OBJS := $(patsubst $(VENDOR)/%,$(BUILDDIR)/%.o,$(SSE2_SRCS))
 ALL_OBJS += $(SSE2_OBJS)
-endif
 
-# SSSE3
-ifneq ($(SSSE3_FLAGS),)
 SSSE3_OBJS := $(patsubst $(VENDOR)/%,$(BUILDDIR)/%.o,$(SSSE3_SRCS))
 ALL_OBJS += $(SSSE3_OBJS)
-endif
 
-# AVX
-ifneq ($(AVX_FLAGS),)
 AVX_OBJS := $(patsubst $(VENDOR)/%,$(BUILDDIR)/%.o,$(AVX_SRCS))
 ALL_OBJS += $(AVX_OBJS)
-endif
 
-# AVX2
-ifneq ($(AVX2_FLAGS),)
 AVX2_OBJS := $(patsubst $(VENDOR)/%,$(BUILDDIR)/%.o,$(AVX2_SRCS))
 ALL_OBJS += $(AVX2_OBJS)
-endif
 
-# AVX-512
-ifneq ($(AVX512_FLAGS),)
 AVX512_OBJS := $(patsubst $(VENDOR)/%,$(BUILDDIR)/%.o,$(AVX512_SRCS))
 ALL_OBJS += $(AVX512_OBJS)
-endif
 
-# VBMI
-ifneq ($(VBMI_FLAGS),)
 VBMI_OBJS := $(patsubst $(VENDOR)/%,$(BUILDDIR)/%.o,$(VBMI_SRCS))
 ALL_OBJS += $(VBMI_OBJS)
-endif
 
-# GFNI
-ifneq ($(GFNI_FLAGS),)
 GFNI_OBJS := $(patsubst $(VENDOR)/%,$(BUILDDIR)/%.o,$(GFNI_SRCS))
 ALL_OBJS += $(GFNI_OBJS)
-endif
 
-# AVX10
-ifneq ($(AVX10_FLAGS),)
 AVX10_OBJS := $(patsubst $(VENDOR)/%,$(BUILDDIR)/%.o,$(AVX10_SRCS))
 ALL_OBJS += $(AVX10_OBJS)
-endif
 
 else ifeq ($(ARCH),aarch64)
 
