@@ -35,6 +35,12 @@ type Options struct {
 	MemoryBudget int
 	// NumGoroutines is the number of parallel workers (default: runtime.NumCPU()).
 	NumGoroutines int
+	// InputCacheBytes is the extra RAM budget for pre-reading all input slices into
+	// memory before encoding. When set to a value >= numInputSlices*sliceSize, every
+	// input slice is read exactly once using parallel I/O and cached for all recovery
+	// block batches. This eliminates repeated disk reads and I/O stalls during the
+	// compute phase. Set to 0 (default) to use the standard 1-ahead prefetch instead.
+	InputCacheBytes int
 	// OnProgress reports progress: phase is "hashing" or "encoding", pct is 0.0-1.0.
 	OnProgress func(phase string, pct float64)
 	// Creator is the creator string embedded in the PAR2 file (default: "Postie").
@@ -148,6 +154,7 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	enc := rsenc.NewEncoder(opts.SliceSize, opts.NumRecovery)
 	enc.SetMemoryBudget(opts.MemoryBudget)
 	enc.SetNumWorkers(opts.NumGoroutines)
+	enc.SetInputCacheBytes(opts.InputCacheBytes)
 
 	// Collect recovery blocks in memory for volume file writing.
 	// Pre-allocate the slice since count is known upfront.

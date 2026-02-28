@@ -240,6 +240,151 @@ func TestEncoderProgress(t *testing.T) {
 	}
 }
 
+func TestEncoderInputCache(t *testing.T) {
+	// Verify that with the input cache enabled, results are byte-for-byte
+	// identical to the no-cache path.
+	sliceSize := 64
+	numInputSlices := 6
+	numRecovery := 4
+
+	inputSlices := make([][]byte, numInputSlices)
+	for i := range inputSlices {
+		inputSlices[i] = make([]byte, sliceSize)
+		for j := range inputSlices[i] {
+			inputSlices[i][j] = byte(i*13 + j*7)
+		}
+	}
+
+	readSlice := func(i int) ([]byte, error) { return inputSlices[i], nil }
+	collect := func(enc *Encoder) (map[uint16][]byte, error) {
+		blocks := make(map[uint16][]byte)
+		err := enc.Process(
+			context.Background(),
+			numInputSlices,
+			readSlice,
+			nil,
+			func(exp uint16, data []byte) error {
+				buf := make([]byte, len(data))
+				copy(buf, data)
+				blocks[exp] = buf
+				return nil
+			},
+			nil,
+		)
+		return blocks, err
+	}
+
+	encNoCache := NewEncoder(sliceSize, numRecovery)
+	noCache, err := collect(encNoCache)
+	if err != nil {
+		t.Fatalf("no-cache Process error: %v", err)
+	}
+
+	encWithCache := NewEncoder(sliceSize, numRecovery)
+	encWithCache.SetInputCacheBytes(numInputSlices * sliceSize)
+	withCache, err := collect(encWithCache)
+	if err != nil {
+		t.Fatalf("cache Process error: %v", err)
+	}
+
+	if len(noCache) != len(withCache) {
+		t.Fatalf("block count mismatch: no-cache=%d cache=%d", len(noCache), len(withCache))
+	}
+	for exp, want := range noCache {
+		got, ok := withCache[exp]
+		if !ok {
+			t.Errorf("missing recovery block exp=%d in cached result", exp)
+			continue
+		}
+		for i, b := range want {
+			if got[i] != b {
+				t.Errorf("exp=%d byte %d: got %d, want %d", exp, i, got[i], b)
+				break
+			}
+		}
+	}
+}
+
+func TestEncoderInputCacheMultiBatch(t *testing.T) {
+	// Force batching (small MemoryBudget) AND enable the input cache.
+	// Results must be identical to the no-cache, no-batch baseline, proving
+	// that the cache eliminates repeated reads correctly.
+	sliceSize := 64
+	numInputSlices := 5
+	numRecovery := 8
+
+	inputSlices := make([][]byte, numInputSlices)
+	for i := range inputSlices {
+		inputSlices[i] = make([]byte, sliceSize)
+		for j := range inputSlices[i] {
+			inputSlices[i][j] = byte(i*17 + j*3 + 1)
+		}
+	}
+
+	readCount := 0
+	readSlice := func(i int) ([]byte, error) {
+		readCount++
+		return inputSlices[i], nil
+	}
+	collect := func(enc *Encoder) (map[uint16][]byte, error) {
+		blocks := make(map[uint16][]byte)
+		err := enc.Process(
+			context.Background(),
+			numInputSlices,
+			readSlice,
+			nil,
+			func(exp uint16, data []byte) error {
+				buf := make([]byte, len(data))
+				copy(buf, data)
+				blocks[exp] = buf
+				return nil
+			},
+			nil,
+		)
+		return blocks, err
+	}
+
+	// Baseline: single batch, no cache
+	encBase := NewEncoder(sliceSize, numRecovery)
+	baseline, err := collect(encBase)
+	if err != nil {
+		t.Fatalf("baseline Process error: %v", err)
+	}
+
+	// Multi-batch + cache: budget = 3 blocks → 3 batches; cache covers all input slices
+	readCount = 0
+	encCached := NewEncoder(sliceSize, numRecovery)
+	encCached.SetMemoryBudget(sliceSize * 3)
+	encCached.SetInputCacheBytes(numInputSlices * sliceSize)
+	cached, err := collect(encCached)
+	if err != nil {
+		t.Fatalf("cached+multi-batch Process error: %v", err)
+	}
+
+	// With cache enabled, each slice should be read exactly once (during pre-read).
+	if readCount != numInputSlices {
+		t.Errorf("expected %d reads with cache, got %d", numInputSlices, readCount)
+	}
+
+	// Results must match baseline.
+	if len(baseline) != len(cached) {
+		t.Fatalf("block count mismatch: baseline=%d cached=%d", len(baseline), len(cached))
+	}
+	for exp, want := range baseline {
+		got, ok := cached[exp]
+		if !ok {
+			t.Errorf("missing recovery block exp=%d in cached result", exp)
+			continue
+		}
+		for i, b := range want {
+			if got[i] != b {
+				t.Errorf("exp=%d byte %d: got %d, want %d", exp, i, got[i], b)
+				break
+			}
+		}
+	}
+}
+
 func BenchmarkEncoderProcess(b *testing.B) {
 	// Simulate encoding 1MB of data with 10% redundancy
 	sliceSize := 10000

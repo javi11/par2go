@@ -17,11 +17,12 @@ const DefaultMemoryBudget = 512 * 1024 * 1024
 
 // Encoder performs PAR2-compatible Reed-Solomon encoding.
 type Encoder struct {
-	sliceSize    int
-	numRecovery  int
-	memoryBudget int
-	numWorkers   int
-	exponents    []uint16 // recovery block exponents
+	sliceSize      int
+	numRecovery    int
+	memoryBudget   int
+	numWorkers     int
+	inputCacheBytes int
+	exponents      []uint16 // recovery block exponents
 }
 
 // NewEncoder creates a new RS encoder for the given parameters.
@@ -46,6 +47,18 @@ func (e *Encoder) SetMemoryBudget(bytes int) {
 func (e *Encoder) SetNumWorkers(n int) {
 	if n > 0 {
 		e.numWorkers = n
+	}
+}
+
+// SetInputCacheBytes sets the memory budget for pre-reading all input slices
+// into RAM before encoding begins. When the budget covers all input slices
+// (inputCacheBytes >= numInputSlices * sliceSize), every slice is read once
+// using parallel I/O and held in memory for the duration of Process, eliminating
+// repeated disk reads across multiple recovery-block batches.
+// Set to 0 (default) to disable and use the existing 1-ahead prefetch.
+func (e *Encoder) SetInputCacheBytes(bytes int) {
+	if bytes >= 0 {
+		e.inputCacheBytes = bytes
 	}
 }
 
@@ -123,6 +136,72 @@ func (e *Encoder) Process(
 		batchSize = 1
 	}
 
+	// Pre-read all input slices in parallel when the budget allows.
+	// This eliminates repeated disk reads across multiple recovery-block batches
+	// and lets the compute phase run without any I/O stalls.
+	var inputCache [][]byte
+	useCache := e.inputCacheBytes > 0 &&
+		int64(e.inputCacheBytes) >= int64(numInputSlices)*int64(e.sliceSize)
+
+	if useCache {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		inputCache = make([][]byte, numInputSlices)
+		const maxParallelReads = 16
+		type readResult struct {
+			idx  int
+			data []byte
+			err  error
+		}
+		resultCh := make(chan readResult, numInputSlices)
+		sem := make(chan struct{}, maxParallelReads)
+
+		for i := 0; i < numInputSlices; i++ {
+			sem <- struct{}{}
+			go func(idx int) {
+				defer func() { <-sem }()
+				data, err := readSlice(idx)
+				resultCh <- readResult{idx, data, err}
+			}(i)
+		}
+
+		var firstErr error
+		for i := 0; i < numInputSlices; i++ {
+			r := <-resultCh
+			if r.err != nil && firstErr == nil {
+				firstErr = r.err
+			}
+			if r.err == nil {
+				inputCache[r.idx] = r.data
+			} else if releaseSlice != nil && r.data != nil {
+				releaseSlice(r.data)
+			}
+		}
+
+		if firstErr != nil {
+			if releaseSlice != nil {
+				for _, s := range inputCache {
+					if s != nil {
+						releaseSlice(s)
+					}
+				}
+			}
+			return firstErr
+		}
+
+		defer func() {
+			if releaseSlice != nil {
+				for _, s := range inputCache {
+					if s != nil {
+						releaseSlice(s)
+					}
+				}
+			}
+		}()
+	}
+
 	totalWork := float64(numInputSlices) * float64(e.numRecovery)
 	doneWork := float64(0)
 
@@ -172,6 +251,7 @@ func (e *Encoder) Process(
 
 	// Double-buffered I/O: pre-read the next input slice while the current
 	// one is being processed, overlapping disk I/O with compute.
+	// Only used when inputCache is not active.
 	type prefetchResult struct {
 		data []byte
 		err  error
@@ -193,19 +273,23 @@ func (e *Encoder) Process(
 			recoveryBlocks[j] = gf16.AlignedSlice(e.sliceSize)
 		}
 
-		// Kick off first read for this batch
-		go func() {
-			d, err := readSlice(0)
-			prefetchCh <- prefetchResult{d, err}
-		}()
+		if !useCache {
+			// Kick off first read for this batch
+			go func() {
+				d, err := readSlice(0)
+				prefetchCh <- prefetchResult{d, err}
+			}()
+		}
 
 		// Read each input slice and accumulate into all recovery blocks in this batch
 		for i := 0; i < numInputSlices; i++ {
 			if err := ctx.Err(); err != nil {
-				// Drain pending prefetch to avoid goroutine leak
-				result := <-prefetchCh
-				if releaseSlice != nil && result.data != nil {
-					releaseSlice(result.data)
+				if !useCache {
+					// Drain pending prefetch to avoid goroutine leak
+					result := <-prefetchCh
+					if releaseSlice != nil && result.data != nil {
+						releaseSlice(result.data)
+					}
 				}
 				for k := range recoveryBlocks {
 					gf16.FreeAligned(recoveryBlocks[k])
@@ -213,23 +297,28 @@ func (e *Encoder) Process(
 				return err
 			}
 
-			// Receive prefetched slice
-			result := <-prefetchCh
-			if result.err != nil {
-				for k := range recoveryBlocks {
-					gf16.FreeAligned(recoveryBlocks[k])
+			var sliceData []byte
+			if useCache {
+				sliceData = inputCache[i]
+			} else {
+				// Receive prefetched slice
+				result := <-prefetchCh
+				if result.err != nil {
+					for k := range recoveryBlocks {
+						gf16.FreeAligned(recoveryBlocks[k])
+					}
+					return result.err
 				}
-				return result.err
-			}
-			sliceData := result.data
+				sliceData = result.data
 
-			// Pre-read next slice while processing current one
-			if i+1 < numInputSlices {
-				nextIdx := i + 1
-				go func() {
-					d, err := readSlice(nextIdx)
-					prefetchCh <- prefetchResult{d, err}
-				}()
+				// Pre-read next slice while processing current one
+				if i+1 < numInputSlices {
+					nextIdx := i + 1
+					go func() {
+						d, err := readSlice(nextIdx)
+						prefetchCh <- prefetchResult{d, err}
+					}()
+				}
 			}
 
 			// Dispatch to worker pool or process inline
@@ -269,7 +358,7 @@ func (e *Encoder) Process(
 				}
 			}
 
-			if releaseSlice != nil {
+			if !useCache && releaseSlice != nil {
 				releaseSlice(sliceData)
 			}
 
