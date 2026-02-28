@@ -194,6 +194,36 @@ func (gf *GF16) MulAddPacked(dst, src []byte, coefficient uint16, scratch *Scrat
 	)
 }
 
+// MulAddPackedMulti accumulates one prepared src into multiple dst buffers
+// in a single CGo call, reducing per-buffer CGo overhead from O(N) to O(1).
+// All dst buffers and src must be aligned to Alignment() bytes.
+// coefficients[i] == 0 entries are skipped.
+func (gf *GF16) MulAddPackedMulti(dsts [][]byte, src []byte, coefficients []uint16, scratch *Scratch) {
+	if len(src) == 0 || len(dsts) == 0 {
+		return
+	}
+	// Build a contiguous slice of dst pointers (all point to C-allocated memory).
+	ptrs := make([]unsafe.Pointer, len(dsts))
+	for i, d := range dsts {
+		if len(d) > 0 {
+			ptrs[i] = unsafe.Pointer(&d[0])
+		}
+	}
+	var scratchPtr unsafe.Pointer
+	if scratch != nil {
+		scratchPtr = scratch.ptr
+	}
+	C.parpar_gf16_muladd_packed_multi(
+		gf.handle,
+		unsafe.Pointer(&ptrs[0]),
+		C.size_t(len(dsts)),
+		unsafe.Pointer(&src[0]),
+		(*C.uint16_t)(unsafe.Pointer(&coefficients[0])),
+		C.size_t(len(src)),
+		scratchPtr,
+	)
+}
+
 // mulAddScalarTail handles the tail bytes that don't fill a full stride.
 // It uses log/exp table lookups, same algorithm as the pure-Go fallback.
 func mulAddScalarTail(dst, src []byte, factor uint16) {

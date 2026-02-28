@@ -208,6 +208,68 @@ func TestMulAccumulateFactorOne(t *testing.T) {
 	}
 }
 
+func TestBatchAccumulateMulti(t *testing.T) {
+	// Verify AccumulateMulti produces the same result as N sequential
+	// AccumulatePrepared calls with the same factors.
+	size := 128
+	factors := []uint16{2, 7, 0, 13, 1} // includes zero and one
+
+	src := make([]byte, size)
+	for i := range src {
+		src[i] = byte(i + 1)
+	}
+
+	// Compute expected via sequential AccumulatePrepared
+	expected := make([][]byte, len(factors))
+	for i := range expected {
+		expected[i] = AlignedSlice(size)
+	}
+	defer func() {
+		for _, e := range expected {
+			FreeAligned(e)
+		}
+	}()
+
+	ba1 := NewBatchAccumulator(size)
+	defer ba1.Free()
+	ba1.PrepareInput(src)
+	for i, f := range factors {
+		ba1.AccumulatePrepared(expected[i], f)
+	}
+	for i := range expected {
+		ba1.FinishBlock(expected[i])
+	}
+
+	// Compute via AccumulateMulti
+	dsts := make([][]byte, len(factors))
+	for i := range dsts {
+		dsts[i] = AlignedSlice(size)
+	}
+	defer func() {
+		for _, d := range dsts {
+			FreeAligned(d)
+		}
+	}()
+
+	ba2 := NewBatchAccumulator(size)
+	defer ba2.Free()
+	ba2.PrepareInput(src)
+	ba2.AccumulateMulti(dsts, factors)
+	for i := range dsts {
+		ba2.FinishBlock(dsts[i])
+	}
+
+	// Compare results
+	for i := range dsts {
+		for j := 0; j < size; j++ {
+			if dsts[i][j] != expected[i][j] {
+				t.Errorf("dst[%d][%d]: got %d, want %d (factor=%d)", i, j, dsts[i][j], expected[i][j], factors[i])
+				break
+			}
+		}
+	}
+}
+
 func BenchmarkMul(b *testing.B) {
 	a, bb := uint16(12345), uint16(54321)
 	for i := 0; i < b.N; i++ {

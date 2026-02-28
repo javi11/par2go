@@ -52,6 +52,15 @@ void parpar_gf16_muladd(parpar_gf16_t* gf, void* dst, const void* src,
 void parpar_gf16_muladd_packed(parpar_gf16_t* gf, void* dst, const void* src,
                                 size_t len, uint16_t coefficient, void* scratch);
 
+// Multi-destination variant: accumulates one prepared src into dst_count
+// destination buffers in a single call, eliminating per-buffer CGo overhead.
+// dsts_array is a void* that points to an array of dst_count void* pointers.
+// Each dsts[i] must be aligned. coefficients[i] == 0 entries are skipped.
+void parpar_gf16_muladd_packed_multi(parpar_gf16_t* gf, void* dsts_array,
+                                     size_t dst_count, const void* src,
+                                     const uint16_t* coefficients, size_t len,
+                                     void* scratch);
+
 // Convert raw data to packed format for SIMD processing.
 // dst must be aligned. dst and src may be the same pointer.
 void parpar_gf16_prepare(parpar_gf16_t* gf, void* dst, const void* src, size_t len);

@@ -107,6 +107,34 @@ func (ba *BatchAccumulator) AccumulatePrepared(dst []byte, factor uint16) {
 	}
 }
 
+// AccumulateMulti adds the prepared input into multiple dst buffers in a single
+// CGo call. Each dst[i] is multiplied by factors[i]; zero factors are skipped.
+// All dsts must be aligned (allocated via AlignedSlice) and have the same length.
+// len(dsts) must equal len(factors).
+// This call performs a single CGo boundary crossing regardless of len(dsts).
+func (ba *BatchAccumulator) AccumulateMulti(dsts [][]byte, factors []uint16) {
+	if len(dsts) == 0 {
+		return
+	}
+	srcLen := len(dsts[0])
+	if gf16Inst.NeedsPrepare() {
+		gf16Inst.MulAddPackedMulti(dsts, ba.prepBuf[:srcLen], factors, ba.scratch)
+	} else {
+		// Fallback: per-dst loop (non-packed methods are scalar; CGo overhead is lower)
+		for i, dst := range dsts {
+			factor := factors[i]
+			if factor == 0 {
+				continue
+			}
+			if factor == 1 {
+				xorBytes(dst, ba.prepBuf[:len(dst)])
+				continue
+			}
+			gf16Inst.MulAdd(dst, ba.prepBuf[:len(dst)], factor, ba.scratch)
+		}
+	}
+}
+
 // FinishBlock converts a recovery block from packed format back to raw format
 // in-place. Call once per recovery block after all inputs have been accumulated.
 // No-op when NeedsPrepare() is false.

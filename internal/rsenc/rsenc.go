@@ -108,6 +108,13 @@ func GenerateConstants(numInputSlices int) []uint16 {
 // If releaseSlice is non-nil, it is called after each slice is consumed
 // to allow the caller to return buffers to a pool.
 //
+// writeRecovery receives aligned C-managed memory directly (zero-copy). After
+// writeRecovery returns successfully, releaseRecovery (if non-nil) is called
+// with the same buffer. Callers that copy the data in writeRecovery should pass
+// gf16.FreeAligned as releaseRecovery to free the aligned buffer immediately.
+// Callers that store the buffer (for later use) should pass nil and free each
+// buffer themselves via gf16.FreeAligned when done.
+//
 // For each recovery block e and input slice i:
 //
 //	recoveryBlock[e] ^= inputSlice[i] * constant[i] ^ exponent[e]
@@ -119,6 +126,7 @@ func (e *Encoder) Process(
 	readSlice func(i int) ([]byte, error),
 	releaseSlice func([]byte),
 	writeRecovery func(exponent uint16, data []byte) error,
+	releaseRecovery func([]byte),
 	onProgress func(float64),
 ) error {
 	if numInputSlices == 0 || e.numRecovery == 0 {
@@ -231,17 +239,23 @@ func (e *Encoder) Process(
 		taskCh = make(chan accTask, numWorkers)
 		doneCh = make(chan struct{}, numWorkers)
 
+		// maxBlocksPerWorker bounds the pre-allocated factors slice per worker.
+		maxBlocksPerWorker := (batchSize + numWorkers - 1) / numWorkers
+
 		for w := 0; w < numWorkers; w++ {
 			go func() {
 				ba := gf16.NewBatchAccumulator(e.sliceSize)
 				defer ba.Free()
+				// Pre-allocate factors slice: reused across all tasks for this worker.
+				factors := make([]uint16, maxBlocksPerWorker)
 				for task := range taskCh {
 					ba.PrepareInput(activeSliceData)
-					for j := task.start; j < task.end; j++ {
-						exp := e.exponents[task.batchStart+j]
-						factor := gf16.Pow(task.constant, exp)
-						ba.AccumulatePrepared(activeRecoveryBlocks[j], factor)
+					n := task.end - task.start
+					for j := 0; j < n; j++ {
+						exp := e.exponents[task.batchStart+task.start+j]
+						factors[j] = gf16.Pow(task.constant, exp)
 					}
+					ba.AccumulateMulti(activeRecoveryBlocks[task.start:task.end], factors[:n])
 					doneCh <- struct{}{}
 				}
 			}()
@@ -375,26 +389,30 @@ func (e *Encoder) Process(
 			serialAcc.FinishBlock(recoveryBlocks[j])
 		}
 
-		// Write completed recovery blocks
+		// Deliver completed recovery blocks directly (zero-copy).
+		// The aligned buffer is passed straight to writeRecovery without copying.
+		// releaseRecovery (if non-nil) is called after writeRecovery returns so
+		// callers that copy the data can free the buffer immediately; callers that
+		// store the buffer should pass nil and free it themselves later.
 		for j := 0; j < batchCount; j++ {
 			if err := ctx.Err(); err != nil {
-				// Free remaining aligned blocks on early exit
+				// Free remaining aligned blocks not yet passed to the caller.
 				for k := j; k < batchCount; k++ {
 					gf16.FreeAligned(recoveryBlocks[k])
 				}
 				return err
 			}
 			exponent := e.exponents[batchStart+j]
-			// Copy to GC-managed memory and immediately free the aligned block.
-			goBuf := make([]byte, e.sliceSize)
-			copy(goBuf, recoveryBlocks[j])
-			gf16.FreeAligned(recoveryBlocks[j])
-			if err := writeRecovery(exponent, goBuf); err != nil {
-				// Free remaining aligned blocks on callback error
+			if err := writeRecovery(exponent, recoveryBlocks[j]); err != nil {
+				// writeRecovery failed: free this block and all remaining ones.
+				gf16.FreeAligned(recoveryBlocks[j])
 				for k := j + 1; k < batchCount; k++ {
 					gf16.FreeAligned(recoveryBlocks[k])
 				}
 				return err
+			}
+			if releaseRecovery != nil {
+				releaseRecovery(recoveryBlocks[j])
 			}
 		}
 	}

@@ -187,6 +187,14 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 		},
 	}
 
+	// Aligned recovery block buffers are passed directly from the encoder
+	// (zero-copy). Free them after volume files have been written.
+	defer func() {
+		for _, rb := range recoveryBlocks {
+			gf16.FreeAligned(rb.data)
+		}
+	}()
+
 	err = enc.Process(
 		ctx,
 		totalInputSlices,
@@ -208,9 +216,11 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 			bufPool.Put(&buf)
 		},
 		func(exponent uint16, data []byte) error {
+			// Store the aligned buffer directly — no copy.
 			recoveryBlocks = append(recoveryBlocks, recoveryBlock{exponent: exponent, data: data})
 			return nil
 		},
+		nil, // releaseRecovery: nil — we own the buffers and free them via defer above
 		func(pct float64) {
 			report("encoding", pct)
 		},

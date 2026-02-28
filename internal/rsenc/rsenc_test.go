@@ -96,6 +96,7 @@ func TestEncoderBasic(t *testing.T) {
 			recoveryBlocks[exponent] = buf
 			return nil
 		},
+		gf16.FreeAligned, // releaseRecovery: free aligned buffer after copy
 		nil,
 	)
 
@@ -153,6 +154,7 @@ func TestEncoderVerifyManually(t *testing.T) {
 			recoveryExp = exponent
 			return nil
 		},
+		gf16.FreeAligned, // releaseRecovery
 		nil,
 	)
 
@@ -195,6 +197,7 @@ func TestEncoderContextCancel(t *testing.T) {
 		func(i int) ([]byte, error) { return make([]byte, sliceSize), nil },
 		nil, // releaseSlice
 		func(exponent uint16, data []byte) error { return nil },
+		gf16.FreeAligned, // releaseRecovery
 		nil,
 	)
 
@@ -219,6 +222,7 @@ func TestEncoderProgress(t *testing.T) {
 		func(i int) ([]byte, error) { return make([]byte, sliceSize), nil },
 		nil, // releaseSlice
 		func(exponent uint16, data []byte) error { return nil },
+		gf16.FreeAligned, // releaseRecovery
 		func(pct float64) {
 			if pct < lastProgress {
 				t.Errorf("progress went backwards: %f -> %f", lastProgress, pct)
@@ -269,6 +273,7 @@ func TestEncoderInputCache(t *testing.T) {
 				blocks[exp] = buf
 				return nil
 			},
+			gf16.FreeAligned, // releaseRecovery
 			nil,
 		)
 		return blocks, err
@@ -339,6 +344,7 @@ func TestEncoderInputCacheMultiBatch(t *testing.T) {
 				blocks[exp] = buf
 				return nil
 			},
+			gf16.FreeAligned, // releaseRecovery
 			nil,
 		)
 		return blocks, err
@@ -411,6 +417,7 @@ func BenchmarkEncoderProcess(b *testing.B) {
 			func(idx int) ([]byte, error) { return inputSlices[idx], nil },
 			nil, // releaseSlice
 			func(exponent uint16, data []byte) error { return nil },
+			gf16.FreeAligned, // releaseRecovery
 			nil,
 		)
 	}
@@ -446,6 +453,7 @@ func TestEncoderBatching(t *testing.T) {
 			recoveryBlocks[exponent] = buf
 			return nil
 		},
+		gf16.FreeAligned, // releaseRecovery
 		nil,
 	)
 
@@ -455,5 +463,87 @@ func TestEncoderBatching(t *testing.T) {
 
 	if len(recoveryBlocks) != numRecovery {
 		t.Fatalf("expected %d recovery blocks, got %d", numRecovery, len(recoveryBlocks))
+	}
+}
+
+func TestEncoderZeroCopyRecovery(t *testing.T) {
+	// Verify that releaseRecovery is called exactly numRecovery times and that
+	// the data passed to writeRecovery matches the baseline (copy-path) output.
+	sliceSize := 64
+	numInputSlices := 4
+	numRecovery := 5
+
+	enc := NewEncoder(sliceSize, numRecovery)
+	enc.SetMemoryBudget(sliceSize * numRecovery) // single batch
+
+	inputSlices := make([][]byte, numInputSlices)
+	for i := range inputSlices {
+		inputSlices[i] = make([]byte, sliceSize)
+		for j := range inputSlices[i] {
+			inputSlices[i][j] = byte(i*13 + j*7)
+		}
+	}
+
+	// Baseline: copy path
+	baselineBlocks := make(map[uint16][]byte)
+	if err := enc.Process(
+		context.Background(),
+		numInputSlices,
+		func(i int) ([]byte, error) { return inputSlices[i], nil },
+		nil,
+		func(exp uint16, data []byte) error {
+			buf := make([]byte, len(data))
+			copy(buf, data)
+			baselineBlocks[exp] = buf
+			return nil
+		},
+		gf16.FreeAligned,
+		nil,
+	); err != nil {
+		t.Fatalf("baseline Process error: %v", err)
+	}
+
+	// Zero-copy path: count releaseRecovery calls, verify data equals baseline
+	releaseCount := 0
+	copiedBlocks := make(map[uint16][]byte)
+	if err := enc.Process(
+		context.Background(),
+		numInputSlices,
+		func(i int) ([]byte, error) { return inputSlices[i], nil },
+		nil,
+		func(exp uint16, data []byte) error {
+			buf := make([]byte, len(data))
+			copy(buf, data) // copy before release
+			copiedBlocks[exp] = buf
+			return nil
+		},
+		func(data []byte) {
+			releaseCount++
+			gf16.FreeAligned(data)
+		},
+		nil,
+	); err != nil {
+		t.Fatalf("zero-copy Process error: %v", err)
+	}
+
+	if releaseCount != numRecovery {
+		t.Errorf("releaseRecovery called %d times, want %d", releaseCount, numRecovery)
+	}
+
+	if len(copiedBlocks) != numRecovery {
+		t.Fatalf("expected %d blocks, got %d", numRecovery, len(copiedBlocks))
+	}
+	for exp, want := range baselineBlocks {
+		got, ok := copiedBlocks[exp]
+		if !ok {
+			t.Errorf("missing block exp=%d", exp)
+			continue
+		}
+		for i, b := range want {
+			if got[i] != b {
+				t.Errorf("exp=%d byte %d: got %d, want %d", exp, i, got[i], b)
+				break
+			}
+		}
 	}
 }

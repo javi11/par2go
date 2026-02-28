@@ -23,8 +23,8 @@ ARCH ?= $(if $(filter x86_64 amd64,$(UNAME_M)),x86_64,$(if $(filter aarch64 arm6
 # Common flags
 # -fPIC is needed on Unix for position-independent code; on Windows (MinGW) it's
 # ignored but harmless. We keep it unconditionally for simplicity.
-CFLAGS_COMMON   := -O2 -fPIC -std=gnu99 -Wno-unused-function -I$(VENDOR)
-CXXFLAGS_COMMON := -O2 -fPIC -std=c++11 -Wno-unused-function -I$(VENDOR)
+CFLAGS_COMMON   := -O3 -fPIC -std=gnu99 -Wno-unused-function -funroll-loops -I$(VENDOR)
+CXXFLAGS_COMMON := -O3 -fPIC -std=c++11 -Wno-unused-function -funroll-loops -I$(VENDOR)
 
 # We need PARPAR_INVERT_SUPPORT for mul_add to be available
 DEFINES := -DPARPAR_INVERT_SUPPORT -DPARPAR_SLIM_GF16

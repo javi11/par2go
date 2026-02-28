@@ -122,6 +122,19 @@ void parpar_gf16_muladd_packed(parpar_gf16_t* gf, void* dst, const void* src,
     gf->mul->mul_add(dst, src, len, coefficient, scratch);
 }
 
+void parpar_gf16_muladd_packed_multi(parpar_gf16_t* gf, void* dsts_array,
+                                     size_t dst_count, const void* src,
+                                     const uint16_t* coefficients, size_t len,
+                                     void* scratch) {
+    if (!gf || !gf->mul || len == 0 || dst_count == 0) return;
+    void** dsts = static_cast<void**>(dsts_array);
+    for (size_t i = 0; i < dst_count; i++) {
+        if (coefficients[i] != 0) {
+            gf->mul->mul_add(dsts[i], src, len, coefficients[i], scratch);
+        }
+    }
+}
+
 void parpar_gf16_prepare(parpar_gf16_t* gf, void* dst, const void* src, size_t len) {
     if (!gf || !gf->mul || len == 0) return;
     gf->mul->prepare(dst, src, len);
