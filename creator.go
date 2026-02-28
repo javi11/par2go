@@ -149,8 +149,9 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	enc.SetMemoryBudget(opts.MemoryBudget)
 	enc.SetNumWorkers(opts.NumGoroutines)
 
-	// Collect recovery blocks in memory for volume file writing
-	var recoveryBlocks []recoveryBlock
+	// Collect recovery blocks in memory for volume file writing.
+	// Pre-allocate the slice since count is known upfront.
+	recoveryBlocks := make([]recoveryBlock, 0, opts.NumRecovery)
 
 	// Open all input files upfront to avoid repeated open/close per slice
 	openFiles := make([]*os.File, len(files))

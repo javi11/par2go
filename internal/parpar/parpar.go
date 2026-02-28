@@ -136,6 +136,64 @@ func (gf *GF16) MulAdd(dst, src []byte, coefficient uint16, scratch *Scratch) {
 	}
 }
 
+// NeedsPrepare returns true if the selected SIMD method requires data to be
+// converted to an internal packed format before processing. When true, use
+// Prepare/MulAddPacked/Finish for batch operations to avoid repeated
+// alloc/copy overhead in the hot path.
+func (gf *GF16) NeedsPrepare() bool {
+	return C.parpar_gf16_needs_prepare(gf.handle) != 0
+}
+
+// Prepare converts src data to the packed format required by MulAddPacked.
+// dst must be aligned to Alignment() bytes. dst and src may be the same pointer.
+// len(dst) must equal len(src).
+func (gf *GF16) Prepare(dst, src []byte) {
+	if len(src) == 0 {
+		return
+	}
+	C.parpar_gf16_prepare(
+		gf.handle,
+		unsafe.Pointer(&dst[0]),
+		unsafe.Pointer(&src[0]),
+		C.size_t(len(src)),
+	)
+}
+
+// Finish converts packed data back to raw format in-place.
+// buf must be aligned to Alignment() bytes.
+func (gf *GF16) Finish(buf []byte) {
+	if len(buf) == 0 {
+		return
+	}
+	C.parpar_gf16_finish(
+		gf.handle,
+		unsafe.Pointer(&buf[0]),
+		C.size_t(len(buf)),
+	)
+}
+
+// MulAddPacked computes dst[i] ^= src[i] * coefficient in GF(2^16) on
+// already-prepared (packed) data. Both dst and src must be aligned to
+// Alignment() bytes. Use Prepare before calling and Finish after all
+// accumulation is complete for a given buffer.
+func (gf *GF16) MulAddPacked(dst, src []byte, coefficient uint16, scratch *Scratch) {
+	if len(src) == 0 || coefficient == 0 {
+		return
+	}
+	var scratchPtr unsafe.Pointer
+	if scratch != nil {
+		scratchPtr = scratch.ptr
+	}
+	C.parpar_gf16_muladd_packed(
+		gf.handle,
+		unsafe.Pointer(&dst[0]),
+		unsafe.Pointer(&src[0]),
+		C.size_t(len(src)),
+		C.uint16_t(coefficient),
+		scratchPtr,
+	)
+}
+
 // mulAddScalarTail handles the tail bytes that don't fill a full stride.
 // It uses log/exp table lookups, same algorithm as the pure-Go fallback.
 func mulAddScalarTail(dst, src []byte, factor uint16) {

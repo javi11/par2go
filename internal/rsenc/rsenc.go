@@ -141,6 +141,10 @@ func (e *Encoder) Process(
 	var activeRecoveryBlocks [][]byte
 	var activeSliceData []byte
 
+	// Serial accumulator used for the non-parallel path and for FinishBlock.
+	serialAcc := gf16.NewBatchAccumulator(e.sliceSize)
+	defer serialAcc.Free()
+
 	var taskCh chan accTask
 	var doneCh chan struct{}
 
@@ -150,11 +154,14 @@ func (e *Encoder) Process(
 
 		for w := 0; w < numWorkers; w++ {
 			go func() {
+				ba := gf16.NewBatchAccumulator(e.sliceSize)
+				defer ba.Free()
 				for task := range taskCh {
+					ba.PrepareInput(activeSliceData)
 					for j := task.start; j < task.end; j++ {
 						exp := e.exponents[task.batchStart+j]
 						factor := gf16.Pow(task.constant, exp)
-						gf16.MulAccumulate(activeRecoveryBlocks[j], activeSliceData, factor)
+						ba.AccumulatePrepared(activeRecoveryBlocks[j], factor)
 					}
 					doneCh <- struct{}{}
 				}
@@ -179,10 +186,11 @@ func (e *Encoder) Process(
 		}
 		batchCount := batchEnd - batchStart
 
-		// Allocate recovery block buffers for this batch
+		// Allocate aligned recovery block buffers for this batch.
+		// Aligned memory is required for MulAddPacked and Finish.
 		recoveryBlocks := make([][]byte, batchCount)
 		for j := range recoveryBlocks {
-			recoveryBlocks[j] = make([]byte, e.sliceSize)
+			recoveryBlocks[j] = gf16.AlignedSlice(e.sliceSize)
 		}
 
 		// Kick off first read for this batch
@@ -199,12 +207,18 @@ func (e *Encoder) Process(
 				if releaseSlice != nil && result.data != nil {
 					releaseSlice(result.data)
 				}
+				for k := range recoveryBlocks {
+					gf16.FreeAligned(recoveryBlocks[k])
+				}
 				return err
 			}
 
 			// Receive prefetched slice
 			result := <-prefetchCh
 			if result.err != nil {
+				for k := range recoveryBlocks {
+					gf16.FreeAligned(recoveryBlocks[k])
+				}
 				return result.err
 			}
 			sliceData := result.data
@@ -247,10 +261,11 @@ func (e *Encoder) Process(
 				}
 			} else {
 				// Serial: not enough blocks to warrant parallelism
+				serialAcc.PrepareInput(sliceData)
 				for j := 0; j < batchCount; j++ {
 					exp := e.exponents[batchStart+j]
 					factor := gf16.Pow(constants[i], exp)
-					gf16.MulAccumulate(recoveryBlocks[j], sliceData, factor)
+					serialAcc.AccumulatePrepared(recoveryBlocks[j], factor)
 				}
 			}
 
@@ -264,13 +279,32 @@ func (e *Encoder) Process(
 			}
 		}
 
+		// Convert recovery blocks from packed format back to raw, then
+		// copy each to a Go-managed slice and free the aligned buffer.
+		// This keeps the writeRecovery callback's memory contract unchanged.
+		for j := 0; j < batchCount; j++ {
+			serialAcc.FinishBlock(recoveryBlocks[j])
+		}
+
 		// Write completed recovery blocks
 		for j := 0; j < batchCount; j++ {
 			if err := ctx.Err(); err != nil {
+				// Free remaining aligned blocks on early exit
+				for k := j; k < batchCount; k++ {
+					gf16.FreeAligned(recoveryBlocks[k])
+				}
 				return err
 			}
 			exponent := e.exponents[batchStart+j]
-			if err := writeRecovery(exponent, recoveryBlocks[j]); err != nil {
+			// Copy to GC-managed memory and immediately free the aligned block.
+			goBuf := make([]byte, e.sliceSize)
+			copy(goBuf, recoveryBlocks[j])
+			gf16.FreeAligned(recoveryBlocks[j])
+			if err := writeRecovery(exponent, goBuf); err != nil {
+				// Free remaining aligned blocks on callback error
+				for k := j + 1; k < batchCount; k++ {
+					gf16.FreeAligned(recoveryBlocks[k])
+				}
 				return err
 			}
 		}
