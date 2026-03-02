@@ -46,6 +46,32 @@ func FreeAligned(b []byte) {
 	parpar.FreeAligned(b)
 }
 
+// NeedsPrepare returns whether the current backend requires prepare/finish.
+func NeedsPrepare() bool {
+	gf16Once.Do(initParPar)
+	return gf16Inst.NeedsPrepare()
+}
+
+// HasMultiPacked returns whether the hardware mul_add_multi_packed SIMD kernel
+// is available (as opposed to only the scalar fallback).
+func HasMultiPacked() bool {
+	gf16Once.Do(initParPar)
+	return gf16Inst.HasMultiPacked()
+}
+
+// IdealInputMultiple returns the SIMD batch size for AccumulateAllInputs.
+func IdealInputMultiple() int {
+	gf16Once.Do(initParPar)
+	return gf16Inst.IdealInputMultiple()
+}
+
+// PrepareInto packs src into dst (already aligned, same length).
+// Use to build the contiguous packed-inputs buffer for BatchAccumulator.AccumulateAllInputs.
+func PrepareInto(dst, src []byte) {
+	gf16Once.Do(initParPar)
+	gf16Inst.Prepare(dst, src)
+}
+
 // BatchAccumulator holds per-goroutine state for the prepare-once/accumulate-many
 // pattern. It pre-allocates an aligned input-preparation buffer so that each
 // input slice is prepared exactly once, and MulAddPacked is used for all
@@ -53,8 +79,9 @@ func FreeAligned(b []byte) {
 //
 // Create one per goroutine; it is NOT safe for concurrent use.
 type BatchAccumulator struct {
-	prepBuf []byte
-	scratch *parpar.Scratch
+	prepBuf       []byte
+	scratch       *parpar.Scratch
+	packedRegions int // cached ideal SIMD batch size for AccumulateAllInputs
 }
 
 // NewBatchAccumulator creates a BatchAccumulator with a pre-allocated aligned
@@ -63,8 +90,9 @@ func NewBatchAccumulator(size int) *BatchAccumulator {
 	gf16Once.Do(initParPar)
 	s := scratchPool.Get().(*parpar.Scratch)
 	return &BatchAccumulator{
-		prepBuf: gf16Inst.AlignedSlice(size),
-		scratch: s,
+		prepBuf:       gf16Inst.AlignedSlice(size),
+		scratch:       s,
+		packedRegions: gf16Inst.IdealInputMultiple(),
 	}
 }
 
@@ -133,6 +161,25 @@ func (ba *BatchAccumulator) AccumulateMulti(dsts [][]byte, factors []uint16) {
 			gf16Inst.MulAdd(dst, ba.prepBuf[:len(dst)], factor, ba.scratch)
 		}
 	}
+}
+
+// AccumulateAllInputs accumulates numInputs prepared input slices (laid
+// contiguously in packedInputs) into dst in a single CGo call.
+//
+//   - packedInputs must be len(dst)*numInputs bytes:
+//     packedInputs[j*sliceLen..(j+1)*sliceLen] is the j-th prepared input.
+//   - dst must be an AlignedSlice.
+//   - coefficients must have length >= numInputs.
+//
+// This is the multi-source fast path: one SIMD call processes all inputs
+// simultaneously, giving 2–4× better utilization than per-input calls.
+func (ba *BatchAccumulator) AccumulateAllInputs(dst, packedInputs []byte,
+	numInputs int, coefficients []uint16) {
+	if numInputs == 0 {
+		return
+	}
+	gf16Inst.MulAddMultiPacked(dst, packedInputs, numInputs, ba.packedRegions,
+		coefficients, ba.scratch)
 }
 
 // FinishBlock converts a recovery block from packed format back to raw format

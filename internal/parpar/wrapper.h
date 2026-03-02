@@ -69,6 +69,30 @@ void parpar_gf16_prepare(parpar_gf16_t* gf, void* dst, const void* src, size_t l
 // dst must be aligned.
 void parpar_gf16_finish(parpar_gf16_t* gf, void* dst, size_t len);
 
+// Returns idealInputMultiple: the SIMD batch size to pass as packed_regions
+// to parpar_gf16_muladd_multi_packed.
+unsigned parpar_gf16_ideal_input_multiple(parpar_gf16_t* gf);
+
+// Returns 1 if the optimized mul_add_multi_packed SIMD kernel is available,
+// 0 if only the scalar fallback is present.
+int parpar_gf16_has_multi_packed(parpar_gf16_t* gf);
+
+// Accumulate N prepared input slices into ONE recovery block (dst).
+// src_packed: N prepared slices laid contiguously at src_packed[j*len..(j+1)*len].
+// dst: recovery block in prepared format (must be AlignedSlice).
+// regions: number of input slices (N).
+// packed_regions: value from parpar_gf16_ideal_input_multiple().
+// coefficients: array of N GF(2^16) coefficients, one per input slice.
+// scratch: per-thread scratch (from parpar_gf16_scratch_alloc).
+void parpar_gf16_muladd_multi_packed(parpar_gf16_t* gf,
+                                      void* dst,
+                                      const void* src_packed,
+                                      unsigned regions,
+                                      unsigned packed_regions,
+                                      size_t len,
+                                      const uint16_t* coefficients,
+                                      void* scratch);
+
 // Allocate memory with the specified alignment.
 void* parpar_aligned_alloc(size_t alignment, size_t size);
 

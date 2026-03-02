@@ -7,7 +7,9 @@ package rsenc
 
 import (
 	"context"
+	"log/slog"
 	"runtime"
+	"sync"
 
 	"github.com/javi11/par2go/internal/gf16"
 )
@@ -208,6 +210,15 @@ func (e *Encoder) Process(
 				}
 			}
 		}()
+	}
+
+	// Fast path: when all inputs are cached and the hardware mul_add_multi_packed
+	// SIMD kernel is available, pack all inputs once and process every recovery
+	// block with a single CGo call per block (instead of N calls per block).
+	if useCache && gf16.NeedsPrepare() && gf16.HasMultiPacked() {
+		slog.Debug("gf16: using mul_add_multi_packed fast path")
+		return e.processMultiSrc(ctx, inputCache, constants,
+			writeRecovery, releaseRecovery, onProgress)
 	}
 
 	totalWork := float64(numInputSlices) * float64(e.numRecovery)
@@ -417,5 +428,133 @@ func (e *Encoder) Process(
 		}
 	}
 
+	return nil
+}
+
+// processMultiSrc is the mul_add_multi_packed fast path activated when all
+// input slices fit in cache and the hardware SIMD kernel is available.
+//
+// Strategy: pack all N inputs contiguously once, then for each recovery block
+// call AccumulateAllInputs which processes all N inputs in a single CGo call.
+// Workers own a disjoint range of recovery blocks — no synchronization needed
+// between them per input slice.
+func (e *Encoder) processMultiSrc(
+	ctx context.Context,
+	inputCache [][]byte,
+	constants []uint16,
+	writeRecovery func(uint16, []byte) error,
+	releaseRecovery func([]byte),
+	onProgress func(float64),
+) error {
+	numInputs := len(inputCache)
+	sliceLen := e.sliceSize
+
+	// Pack all inputs contiguously: allPacked[j*sliceLen..(j+1)*sliceLen]
+	allPacked := gf16.AlignedSlice(numInputs * sliceLen)
+	defer gf16.FreeAligned(allPacked)
+	for j, inp := range inputCache {
+		gf16.PrepareInto(allPacked[j*sliceLen:(j+1)*sliceLen], inp)
+	}
+
+	batchSize := e.memoryBudget / sliceLen
+	if batchSize > e.numRecovery {
+		batchSize = e.numRecovery
+	}
+	if batchSize <= 0 {
+		batchSize = 1
+	}
+
+	finishAcc := gf16.NewBatchAccumulator(sliceLen)
+	defer finishAcc.Free()
+
+	totalWork := float64(e.numRecovery)
+	done := 0.0
+
+	for batchStart := 0; batchStart < e.numRecovery; batchStart += batchSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		batchEnd := batchStart + batchSize
+		if batchEnd > e.numRecovery {
+			batchEnd = e.numRecovery
+		}
+		batchCount := batchEnd - batchStart
+
+		recoveryBlocks := make([][]byte, batchCount)
+		for j := range recoveryBlocks {
+			recoveryBlocks[j] = gf16.AlignedSlice(sliceLen)
+		}
+
+		// Workers each own a contiguous range of recovery blocks — fully
+		// independent, no synchronization per input slice required.
+		numWorkers := e.numWorkers
+		if numWorkers > batchCount {
+			numWorkers = batchCount
+		}
+		type task struct{ start, end int }
+		taskCh := make(chan task, numWorkers)
+		var wg sync.WaitGroup
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ba := gf16.NewBatchAccumulator(sliceLen)
+				defer ba.Free()
+				coeffs := make([]uint16, numInputs)
+				for t := range taskCh {
+					for j := t.start; j < t.end; j++ {
+						exp := e.exponents[batchStart+j]
+						for i := 0; i < numInputs; i++ {
+							coeffs[i] = gf16.Pow(constants[i], exp)
+						}
+						ba.AccumulateAllInputs(recoveryBlocks[j], allPacked, numInputs, coeffs)
+					}
+				}
+			}()
+		}
+		blocksPerWorker := (batchCount + numWorkers - 1) / numWorkers
+		for w := 0; w < numWorkers; w++ {
+			s := w * blocksPerWorker
+			end := s + blocksPerWorker
+			if end > batchCount {
+				end = batchCount
+			}
+			if s >= end {
+				break
+			}
+			taskCh <- task{s, end}
+		}
+		close(taskCh)
+		wg.Wait()
+
+		for j := 0; j < batchCount; j++ {
+			finishAcc.FinishBlock(recoveryBlocks[j])
+		}
+
+		for j := 0; j < batchCount; j++ {
+			if err := ctx.Err(); err != nil {
+				for k := j; k < batchCount; k++ {
+					gf16.FreeAligned(recoveryBlocks[k])
+				}
+				return err
+			}
+			exp := e.exponents[batchStart+j]
+			if err := writeRecovery(exp, recoveryBlocks[j]); err != nil {
+				gf16.FreeAligned(recoveryBlocks[j])
+				for k := j + 1; k < batchCount; k++ {
+					gf16.FreeAligned(recoveryBlocks[k])
+				}
+				return err
+			}
+			if releaseRecovery != nil {
+				releaseRecovery(recoveryBlocks[j])
+			}
+		}
+
+		done += float64(batchCount)
+		if onProgress != nil {
+			onProgress(done / totalWork)
+		}
+	}
 	return nil
 }

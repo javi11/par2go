@@ -194,6 +194,47 @@ func (gf *GF16) MulAddPacked(dst, src []byte, coefficient uint16, scratch *Scrat
 	)
 }
 
+// IdealInputMultiple returns the SIMD batch size to pass as packedRegions to
+// MulAddMultiPacked. Equals idealInputMultiple from Galois16MethodInfo.
+func (gf *GF16) IdealInputMultiple() int {
+	return int(C.parpar_gf16_ideal_input_multiple(gf.handle))
+}
+
+// HasMultiPacked returns true if the hardware mul_add_multi_packed SIMD kernel
+// is available (not just the scalar fallback).
+func (gf *GF16) HasMultiPacked() bool {
+	return C.parpar_gf16_has_multi_packed(gf.handle) != 0
+}
+
+// MulAddMultiPacked accumulates N prepared input slices (laid contiguously in
+// srcPacked) into a single dst recovery block in one CGo call.
+//
+//   - srcPacked must be len(dst)*regions bytes: srcPacked[j*sliceLen..(j+1)*sliceLen]
+//     is the j-th prepared input slice.
+//   - dst must be an AlignedSlice of sliceLen bytes.
+//   - regions is the number of input slices (N).
+//   - packedRegions should be IdealInputMultiple() for best SIMD utilization.
+//   - coefficients must have length >= regions.
+func (gf *GF16) MulAddMultiPacked(dst, srcPacked []byte, regions, packedRegions int,
+	coefficients []uint16, scratch *Scratch) {
+	if regions == 0 || len(dst) == 0 {
+		return
+	}
+	var scratchPtr unsafe.Pointer
+	if scratch != nil {
+		scratchPtr = scratch.ptr
+	}
+	C.parpar_gf16_muladd_multi_packed(
+		gf.handle,
+		unsafe.Pointer(&dst[0]),
+		unsafe.Pointer(&srcPacked[0]),
+		C.uint(regions), C.uint(packedRegions),
+		C.size_t(len(dst)),
+		(*C.uint16_t)(unsafe.Pointer(&coefficients[0])),
+		scratchPtr,
+	)
+}
+
 // MulAddPackedMulti accumulates one prepared src into multiple dst buffers
 // in a single CGo call, reducing per-buffer CGo overhead from O(N) to O(1).
 // All dst buffers and src must be aligned to Alignment() bytes.

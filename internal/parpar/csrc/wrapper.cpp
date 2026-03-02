@@ -135,6 +135,25 @@ void parpar_gf16_muladd_packed_multi(parpar_gf16_t* gf, void* dsts_array,
     }
 }
 
+unsigned parpar_gf16_ideal_input_multiple(parpar_gf16_t* gf) {
+    if (!gf || !gf->mul) return 1;
+    return gf->mul->info().idealInputMultiple;
+}
+
+int parpar_gf16_has_multi_packed(parpar_gf16_t* gf) {
+    if (!gf || !gf->mul) return 0;
+    return gf->mul->hasMultiMulAddPacked() ? 1 : 0;
+}
+
+void parpar_gf16_muladd_multi_packed(parpar_gf16_t* gf, void* dst,
+                                      const void* src_packed, unsigned regions,
+                                      unsigned packed_regions, size_t len,
+                                      const uint16_t* coefficients, void* scratch) {
+    if (!gf || !gf->mul || len == 0 || regions == 0) return;
+    gf->mul->mul_add_multi_packed(packed_regions, regions, dst, src_packed,
+                                   len, coefficients, scratch);
+}
+
 void parpar_gf16_prepare(parpar_gf16_t* gf, void* dst, const void* src, size_t len) {
     if (!gf || !gf->mul || len == 0) return;
     gf->mul->prepare(dst, src, len);
