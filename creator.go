@@ -20,9 +20,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/javi11/par2go/internal/gf16"
 	"github.com/javi11/par2go/internal/packets"
-	"github.com/javi11/par2go/internal/rsenc"
+	"github.com/javi11/par2go/internal/parpar"
 )
 
 // Options configures PAR2 creation.
@@ -31,11 +30,10 @@ type Options struct {
 	SliceSize int
 	// NumRecovery is the number of recovery blocks to create.
 	NumRecovery int
-	// MemoryBudget is the maximum memory for recovery block buffers (default: 512MB).
-	MemoryBudget int
-	// NumGoroutines is the number of parallel workers (default: runtime.NumCPU()).
+	// NumGoroutines is the number of parallel GF compute threads (default: runtime.NumCPU()).
+	// Pass 0 to use hardware_concurrency() auto-detection.
 	NumGoroutines int
-	// OnProgress reports progress: phase is "hashing" or "encoding", pct is 0.0-1.0.
+	// OnProgress reports progress: phase is "hashing", "encoding", or "writing", pct is 0.0-1.0.
 	OnProgress func(phase string, pct float64)
 	// Creator is the creator string embedded in the PAR2 file (default: "Postie").
 	Creator string
@@ -43,9 +41,6 @@ type Options struct {
 
 func (o *Options) withDefaults() Options {
 	opts := *o
-	if opts.MemoryBudget <= 0 {
-		opts.MemoryBudget = rsenc.DefaultMemoryBudget
-	}
 	if opts.NumGoroutines <= 0 {
 		opts.NumGoroutines = runtime.NumCPU()
 	}
@@ -122,7 +117,7 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	mainBody := packets.MainPacket(uint64(opts.SliceSize), fileIDs)
 	recoverySetID := packets.RecoverySetID(mainBody)
 
-	// Phase 3: RS encode recovery blocks
+	// Phase 3: RS encode recovery blocks via PAR2ProcCPU
 	slog.Debug("par2go: encoding recovery blocks",
 		"numRecovery", opts.NumRecovery,
 		"sliceSize", opts.SliceSize)
@@ -145,19 +140,25 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 		return fmt.Errorf("par2go: no input slices (all files empty?)")
 	}
 
-	enc := rsenc.NewEncoder(opts.SliceSize, opts.NumRecovery)
-	enc.SetMemoryBudget(opts.MemoryBudget)
-	enc.SetNumWorkers(opts.NumGoroutines)
+	proc, err := parpar.NewGfProc(opts.SliceSize, opts.NumGoroutines)
+	if err != nil {
+		return fmt.Errorf("par2go: init encoder: %w", err)
+	}
+	defer proc.Close()
 
-	// Collect recovery blocks in memory for volume file writing
-	var recoveryBlocks []recoveryBlock
+	slog.Debug("par2go: encoder ready", "method", proc.MethodName(), "threads", proc.NumThreads())
+
+	exponents := make([]uint16, opts.NumRecovery)
+	for i := range exponents {
+		exponents[i] = uint16(i)
+	}
+	proc.SetRecoverySlices(exponents)
 
 	// Open all input files upfront to avoid repeated open/close per slice
 	openFiles := make([]*os.File, len(files))
 	for i, fi := range files {
 		f, err := os.Open(fi.path)
 		if err != nil {
-			// Close any already-opened files
 			for j := 0; j < i; j++ {
 				_ = openFiles[j].Close()
 			}
@@ -171,7 +172,7 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 		}
 	}()
 
-	// Buffer pool to reuse slice-sized buffers across readSlice calls (pointer to avoid SA6002)
+	// Buffer pool to reuse slice-sized buffers across readSlice calls
 	bufPool := sync.Pool{
 		New: func() any {
 			b := make([]byte, opts.SliceSize)
@@ -179,37 +180,45 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 		},
 	}
 
-	err = enc.Process(
-		ctx,
-		totalInputSlices,
-		func(i int) ([]byte, error) {
-			ref := allSlices[i]
-			ptr := bufPool.Get().(*[]byte)
-			buf := *ptr
-			n, readErr := openFiles[ref.fileIdx].ReadAt(buf, int64(ref.sliceIdx)*int64(opts.SliceSize))
-			if readErr != nil && readErr != io.EOF {
-				bufPool.Put(ptr)
-				return nil, readErr
-			}
-			if n < len(buf) {
-				clear(buf[n:])
-			}
-			return buf, nil
-		},
-		func(buf []byte) {
-			bufPool.Put(&buf)
-		},
-		func(exponent uint16, data []byte) error {
-			recoveryBlocks = append(recoveryBlocks, recoveryBlock{exponent: exponent, data: data})
-			return nil
-		},
-		func(pct float64) {
-			report("encoding", pct)
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("par2go: encoding failed: %w", err)
+	// Feed all input slices to the encoder
+	for i, ref := range allSlices {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		ptr := bufPool.Get().(*[]byte)
+		buf := *ptr
+		n, readErr := openFiles[ref.fileIdx].ReadAt(buf, int64(ref.sliceIdx)*int64(opts.SliceSize))
+		if readErr != nil && readErr != io.EOF {
+			bufPool.Put(ptr)
+			return fmt.Errorf("par2go: read slice %d: %w", i, readErr)
+		}
+		if n < len(buf) {
+			clear(buf[n:])
+		}
+
+		proc.Add(i, buf)
+		bufPool.Put(ptr)
+
+		report("encoding", float64(i+1)/float64(totalInputSlices))
 	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	proc.End()
+
+	// Collect recovery blocks
+	recoveryBlocks := make([]recoveryBlock, opts.NumRecovery)
+	for i := range recoveryBlocks {
+		recoveryBlocks[i] = recoveryBlock{
+			exponent: uint16(i),
+			data:     make([]byte, opts.SliceSize),
+		}
+		proc.GetOutput(i, recoveryBlocks[i].data)
+	}
+	proc.FreeMem()
 
 	report("encoding", 1.0)
 
@@ -464,6 +473,3 @@ func writeVolumeFile(path string, recoverySetID [16]byte, blocks []recoveryBlock
 func crc32Sum(data []byte) uint32 {
 	return crc32.ChecksumIEEE(data)
 }
-
-// Ensure gf16 is imported (used indirectly via rsenc).
-var _ = gf16.Add

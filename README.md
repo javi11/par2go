@@ -10,6 +10,12 @@ go get github.com/javi11/par2go
 
 Requires **Go 1.26** or later.
 
+### SIMD-accelerated encoding
+
+par2go uses pre-built [ParPar](https://github.com/animetosho/ParPar) static libraries for SIMD-optimized Reed-Solomon encoding (SSE2, AVX2, AVX-512, NEON, SVE2, etc. with runtime CPU detection). The static libraries are committed to the repo, so no C++ compiler is needed.
+
+CGO must be enabled (the default). On **Windows**, a MinGW-w64 toolchain is required for linking — install via [MSYS2](https://www.msys2.org/): `pacman -S mingw-w64-x86_64-gcc`.
+
 ## Quick start
 
 ```go

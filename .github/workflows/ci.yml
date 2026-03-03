@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: ['main']
+  pull_request:
+    branches: ['main']
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          repo-checkout: false
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-latest
+            os: linux
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            os: linux
+          - name: macos-arm64
+            runner: macos-latest
+            os: macos
+          - name: windows-amd64
+            runner: windows-latest
+            os: windows
+
+    runs-on: ${{ matrix.runner }}
+    name: test (${{ matrix.name }})
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Set up MSYS2
+        if: matrix.os == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+
+      - name: Add MinGW to PATH
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: echo "$env:RUNNER_TEMP\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Test
+        env:
+          CGO_ENABLED: '1'
+        run: go test -v ./...
+
+      - name: Test with race detector
+        if: matrix.os != 'windows'
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race ./...
