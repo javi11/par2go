@@ -11,7 +11,7 @@ package parpar
 #cgo darwin LDFLAGS: ${SRCDIR}/libparpar_gf16_darwin.a -lstdc++ -lm
 #cgo linux,amd64 LDFLAGS: ${SRCDIR}/libparpar_gf16_linux_amd64.a -lstdc++ -lm -lpthread
 #cgo linux,arm64 LDFLAGS: ${SRCDIR}/libparpar_gf16_linux_arm64.a -lstdc++ -lm -lpthread
-#cgo windows,amd64 LDFLAGS: ${SRCDIR}/libparpar_gf16_windows_amd64.a -lstdc++ -lm
+#cgo windows,amd64 LDFLAGS: ${SRCDIR}/libparpar_gf16_windows_amd64.a -lstdc++ -lm -lpthread
 #include "bridge.h"
 */
 import "C"
