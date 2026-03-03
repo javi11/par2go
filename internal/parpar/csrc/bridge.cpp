@@ -99,8 +99,8 @@ int parpar_gfproc_add(parpar_gfproc_t* proc, unsigned sliceNum, const void* data
 
 void parpar_gfproc_end(parpar_gfproc_t* proc) {
     if (!proc || !proc->cpu) return;
-    // endInput() flushes any buffered inputs and returns a future that
-    // resolves once all compute threads have finished.
+    proc->cpu->flush();  // flush inputs buffered but not yet submitted to compute workers
+    // endInput() returns a future that resolves once all compute threads have finished.
     std::future<void> f = proc->cpu->endInput();
     f.get();
 }
