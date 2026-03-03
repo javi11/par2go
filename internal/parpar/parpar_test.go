@@ -2,272 +2,161 @@ package parpar
 
 import (
 	"bytes"
-	"fmt"
-	"math/rand/v2"
 	"testing"
 )
 
-func TestNew(t *testing.T) {
-	gf, err := New()
+func TestNewGfProc(t *testing.T) {
+	proc, err := NewGfProc(1024, 0)
 	if err != nil {
-		t.Fatalf("New() failed: %v", err)
+		t.Fatalf("NewGfProc failed: %v", err)
 	}
-	defer gf.Close()
+	defer proc.Close()
 
-	name := gf.MethodName()
+	name := proc.MethodName()
 	if name == "" || name == "unknown" {
 		t.Errorf("unexpected method name: %q", name)
 	}
-	t.Logf("Method: %s, Alignment: %d, Stride: %d", name, gf.Alignment(), gf.Stride())
+	t.Logf("Method: %s, Threads: %d", name, proc.NumThreads())
 }
 
-func TestMulAddZeroCoefficient(t *testing.T) {
-	gf, err := New()
+func TestGfProcBasicEncode(t *testing.T) {
+	sliceSize := 1024
+	numInputs := 5
+	numRecovery := 3
+
+	proc, err := NewGfProc(sliceSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer gf.Close()
+	defer proc.Close()
 
-	dst := make([]byte, 64)
-	src := make([]byte, 64)
-	for i := range src {
-		src[i] = byte(i)
+	exponents := make([]uint16, numRecovery)
+	for i := range exponents {
+		exponents[i] = uint16(i)
 	}
-	orig := make([]byte, 64)
-	copy(orig, dst)
+	proc.SetRecoverySlices(exponents)
 
-	scratch := gf.NewScratch()
-	defer scratch.Free()
-
-	gf.MulAdd(dst, src, 0, scratch)
-	if !bytes.Equal(dst, orig) {
-		t.Error("MulAdd with coefficient=0 should be a no-op")
-	}
-}
-
-func TestMulAddCrossValidation(t *testing.T) {
-	gf, err := New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer gf.Close()
-
-	scratch := gf.NewScratch()
-	defer scratch.Free()
-
-	// Use sizes that are multiples of common strides
-	stride := gf.Stride()
-	sizes := []int{stride, stride * 2, stride * 4, stride * 16, stride * 64}
-
-	factors := []uint16{1, 2, 3, 0x1234, 0xFFFF, 0x8000}
-
-	for _, size := range sizes {
-		for _, factor := range factors {
-			t.Run(fmt.Sprintf("size=%d_factor=0x%04X", size, factor), func(t *testing.T) {
-				src := make([]byte, size)
-				for i := range src {
-					src[i] = byte(rand.IntN(256))
-				}
-
-				// ParPar result
-				dstParpar := make([]byte, size)
-				gf.MulAdd(dstParpar, src, factor, scratch)
-
-				// Reference scalar result
-				dstRef := make([]byte, size)
-				refMulAccumulate(dstRef, src, factor)
-
-				if !bytes.Equal(dstParpar, dstRef) {
-					// Find first mismatch
-					for i := range dstParpar {
-						if dstParpar[i] != dstRef[i] {
-							t.Errorf("mismatch at byte %d: parpar=0x%02X ref=0x%02X", i, dstParpar[i], dstRef[i])
-							break
-						}
-					}
-				}
-			})
+	for i := 0; i < numInputs; i++ {
+		data := make([]byte, sliceSize)
+		for j := range data {
+			data[j] = byte(i*7 + j)
 		}
+		proc.Add(i, data)
 	}
-}
+	proc.End()
 
-func TestMulAddNonStrideSize(t *testing.T) {
-	gf, err := New()
-	if err != nil {
-		t.Fatal(err)
+	outputs := make([][]byte, numRecovery)
+	for i := range outputs {
+		outputs[i] = make([]byte, sliceSize)
+		proc.GetOutput(i, outputs[i])
 	}
-	defer gf.Close()
+	proc.FreeMem()
 
-	scratch := gf.NewScratch()
-	defer scratch.Free()
-
-	// Test sizes that are NOT multiples of stride but are multiples of 2
-	stride := gf.Stride()
-	sizes := []int{2, 6, 14, 18, 30, stride + 2, stride*2 + 6}
-
-	for _, size := range sizes {
-		t.Run(fmt.Sprintf("size=%d", size), func(t *testing.T) {
-			src := make([]byte, size)
-			for i := range src {
-				src[i] = byte(rand.IntN(256))
-			}
-
-			dstParpar := make([]byte, size)
-			gf.MulAdd(dstParpar, src, 0x5678, scratch)
-
-			dstRef := make([]byte, size)
-			refMulAccumulate(dstRef, src, 0x5678)
-
-			if !bytes.Equal(dstParpar, dstRef) {
-				for i := range dstParpar {
-					if dstParpar[i] != dstRef[i] {
-						t.Errorf("mismatch at byte %d: parpar=0x%02X ref=0x%02X", i, dstParpar[i], dstRef[i])
-						break
-					}
-				}
-			}
-		})
-	}
-}
-
-func TestMulAddXORSemantics(t *testing.T) {
-	gf, err := New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer gf.Close()
-
-	scratch := gf.NewScratch()
-	defer scratch.Free()
-
-	stride := gf.Stride()
-	size := stride * 4
-
-	src := make([]byte, size)
-	for i := range src {
-		src[i] = byte(rand.IntN(256))
-	}
-
-	// Pre-fill dst with non-zero data
-	dst := make([]byte, size)
-	for i := range dst {
-		dst[i] = byte(rand.IntN(256))
-	}
-	origDst := make([]byte, size)
-	copy(origDst, dst)
-
-	gf.MulAdd(dst, src, 0x42, scratch)
-
-	// Verify XOR semantics: dst should be origDst XOR (src * factor)
-	expected := make([]byte, size)
-	copy(expected, origDst)
-	refMulAccumulate(expected, src, 0x42)
-
-	if !bytes.Equal(dst, expected) {
-		t.Error("MulAdd should XOR into dst, not overwrite")
-	}
-}
-
-func TestMulAddLargeBuffer(t *testing.T) {
-	gf, err := New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer gf.Close()
-
-	scratch := gf.NewScratch()
-	defer scratch.Free()
-
-	// 768KB - typical PAR2 slice size
-	size := 768 * 1024
-	src := make([]byte, size)
-	for i := range src {
-		src[i] = byte(rand.IntN(256))
-	}
-
-	dstParpar := make([]byte, size)
-	gf.MulAdd(dstParpar, src, 0xABCD, scratch)
-
-	dstRef := make([]byte, size)
-	refMulAccumulate(dstRef, src, 0xABCD)
-
-	if !bytes.Equal(dstParpar, dstRef) {
-		for i := range dstParpar {
-			if dstParpar[i] != dstRef[i] {
-				t.Errorf("mismatch at byte %d in 768KB buffer", i)
+	for i, out := range outputs {
+		allZero := true
+		for _, b := range out {
+			if b != 0 {
+				allZero = false
 				break
 			}
 		}
-	}
-}
-
-// Reference implementation for cross-validation.
-func refMulAccumulate(dst, src []byte, factor uint16) {
-	if factor == 0 {
-		return
-	}
-	logF := logTable[factor]
-	for i := 0; i+1 < len(src); i += 2 {
-		val := uint16(src[i]) | uint16(src[i+1])<<8
-		if val == 0 {
-			continue
+		if allZero {
+			t.Errorf("recovery block %d is all zeros", i)
 		}
-		product := expTable[uint32(logTable[val])+uint32(logF)]
-		dst[i] ^= byte(product)
-		dst[i+1] ^= byte(product >> 8)
 	}
 }
 
-func BenchmarkMulAdd(b *testing.B) {
-	gf, err := New()
-	if err != nil {
-		b.Fatal(err)
+func TestGfProcDeterministic(t *testing.T) {
+	sliceSize := 512
+	numInputs := 4
+	numRecovery := 2
+
+	encode := func() [][]byte {
+		proc, err := NewGfProc(sliceSize, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.Close()
+
+		exps := make([]uint16, numRecovery)
+		for i := range exps {
+			exps[i] = uint16(i)
+		}
+		proc.SetRecoverySlices(exps)
+
+		for i := 0; i < numInputs; i++ {
+			data := make([]byte, sliceSize)
+			for j := range data {
+				data[j] = byte(i*13 + j*3)
+			}
+			proc.Add(i, data)
+		}
+		proc.End()
+
+		results := make([][]byte, numRecovery)
+		for i := range results {
+			results[i] = make([]byte, sliceSize)
+			proc.GetOutput(i, results[i])
+		}
+		return results
 	}
-	defer gf.Close()
 
-	scratch := gf.NewScratch()
-	defer scratch.Free()
+	out1 := encode()
+	out2 := encode()
 
-	b.Logf("Method: %s", gf.MethodName())
-
-	for _, size := range []int{1024, 4096, 65536, 1 << 20} {
-		b.Run(fmt.Sprintf("%dB", size), func(b *testing.B) {
-			// Align to stride
-			stride := gf.Stride()
-			aligned := size - (size % stride)
-			if aligned == 0 {
-				aligned = stride
-			}
-
-			src := make([]byte, aligned)
-			dst := make([]byte, aligned)
-			for i := range src {
-				src[i] = byte(i)
-			}
-
-			b.SetBytes(int64(aligned))
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				gf.MulAdd(dst, src, 0x1234, scratch)
-			}
-		})
+	for i := range out1 {
+		if !bytes.Equal(out1[i], out2[i]) {
+			t.Errorf("recovery block %d: non-deterministic encoding", i)
+		}
 	}
 }
 
-func BenchmarkMulAddScalar(b *testing.B) {
-	for _, size := range []int{1024, 4096, 65536, 1 << 20} {
-		b.Run(fmt.Sprintf("%dB", size), func(b *testing.B) {
-			src := make([]byte, size)
-			dst := make([]byte, size)
-			for i := range src {
-				src[i] = byte(i)
-			}
+func BenchmarkGfProcEncode(b *testing.B) {
+	sliceSize := 768 * 1024 // 768KB — typical PAR2 slice
+	numInputs := 20
+	numRecovery := 5
 
-			b.SetBytes(int64(size))
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				refMulAccumulate(dst, src, 0x1234)
-			}
-		})
+	// Prepare input data once outside the loop
+	inputs := make([][]byte, numInputs)
+	for i := range inputs {
+		inputs[i] = make([]byte, sliceSize)
+		for j := range inputs[i] {
+			inputs[i][j] = byte(i*7 + j)
+		}
 	}
+
+	exponents := make([]uint16, numRecovery)
+	for i := range exponents {
+		exponents[i] = uint16(i)
+	}
+
+	b.SetBytes(int64(numInputs) * int64(sliceSize))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		proc, err := NewGfProc(sliceSize, 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+		proc.SetRecoverySlices(exponents)
+		for j, in := range inputs {
+			proc.Add(j, in)
+		}
+		proc.End()
+		dst := make([]byte, sliceSize)
+		for j := range numRecovery {
+			proc.GetOutput(j, dst)
+		}
+		proc.FreeMem()
+		proc.Close()
+	}
+	b.Logf("Method: %s", func() string {
+		p, _ := NewGfProc(sliceSize, 0)
+		if p == nil {
+			return "unknown"
+		}
+		n := p.MethodName()
+		p.Close()
+		return n
+	}())
 }

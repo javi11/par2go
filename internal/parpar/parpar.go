@@ -1,7 +1,7 @@
-// Package parpar provides Go bindings to ParPar's GF(2^16) multiply-accumulate
-// implementation, which includes optimized SIMD backends for 33+ CPU variants
-// (SSE2, SSSE3, AVX, AVX2, AVX-512, GFNI, NEON, SVE, CLMul, RISC-V, etc.)
-// with runtime CPU detection and automatic dispatch.
+// Package parpar provides Go bindings to ParPar's PAR2ProcCPU controller,
+// which implements threaded PAR2-compatible Reed-Solomon encoding with
+// optimized SIMD backends for 33+ CPU variants (SSE2, SSSE3, AVX, AVX2,
+// AVX-512, GFNI, NEON, SVE, CLMul, RISC-V, etc.) and runtime CPU detection.
 //
 // Pre-built static libraries are committed per platform (see build-libs.yml).
 // To rebuild from source: make -C internal/parpar libparpar_gf16.a
@@ -9,330 +9,146 @@ package parpar
 
 /*
 #cgo darwin LDFLAGS: ${SRCDIR}/libparpar_gf16_darwin.a -lstdc++ -lm
-#cgo linux,amd64 LDFLAGS: ${SRCDIR}/libparpar_gf16_linux_amd64.a -lstdc++ -lm
-#cgo linux,arm64 LDFLAGS: ${SRCDIR}/libparpar_gf16_linux_arm64.a -lstdc++ -lm
+#cgo linux,amd64 LDFLAGS: ${SRCDIR}/libparpar_gf16_linux_amd64.a -lstdc++ -lm -lpthread
+#cgo linux,arm64 LDFLAGS: ${SRCDIR}/libparpar_gf16_linux_arm64.a -lstdc++ -lm -lpthread
 #cgo windows,amd64 LDFLAGS: ${SRCDIR}/libparpar_gf16_windows_amd64.a -lstdc++ -lm
-#include "wrapper.h"
-#include <stdlib.h>
-#include <string.h>
+#include "bridge.h"
 */
 import "C"
 
 import (
 	"runtime"
-	"sync"
 	"unsafe"
 )
 
-// GF16 wraps a ParPar Galois16Mul instance with automatic SIMD dispatch.
-// Create one per application; it is safe for concurrent use.
-type GF16 struct {
-	handle *C.parpar_gf16_t
+// GfProc wraps ParPar's PAR2ProcCPU controller for PAR2-compatible
+// Reed-Solomon encoding. It manages a pool of SIMD compute workers,
+// a double-buffered input staging area, and the encoded output.
+//
+// Typical usage:
+//
+//	proc, _ := NewGfProc(sliceSize, 0)          // 0 = hardware_concurrency
+//	proc.SetRecoverySlices([]uint16{0,1,2,...})  // before first Add
+//	for i, data := range inputSlices {
+//	    proc.Add(i, data)
+//	}
+//	proc.End()
+//	for i := range recoverySlices {
+//	    proc.GetOutput(i, recoveryBuf)
+//	}
+//	proc.Close()
+type GfProc struct {
+	handle *C.parpar_gfproc_t
 }
 
-// New creates a new GF16 multiplier with automatic method detection.
-func New() (*GF16, error) {
-	h := C.parpar_gf16_new(0) // 0 = GF16_AUTO
+// AddResult indicates the staging area state at the time of an Add call.
+// Values match PAR2ProcBackendAddResult from the C++ controller.
+type AddResult int
+
+const (
+	AddOK      AddResult = C.PARPAR_ADD_OK       // free staging slot, not busy
+	AddOKBusy  AddResult = C.PARPAR_ADD_OK_BUSY  // can add, previous area still processing
+	AddFull    AddResult = C.PARPAR_ADD_FULL      // had to wait for a staging slot
+	AddAllFull AddResult = C.PARPAR_ADD_ALL_FULL  // controller-level: all full
+)
+
+// NewGfProc creates a new PAR2ProcCPU processor for slices of sliceSize bytes.
+// numThreads sets the number of GF compute worker threads; use 0 to select
+// hardware_concurrency() automatically.
+//
+// Call SetRecoverySlices before the first Add.
+func NewGfProc(sliceSize int, numThreads int) (*GfProc, error) {
+	h := C.parpar_gfproc_new(C.size_t(sliceSize), C.int(numThreads))
 	if h == nil {
 		return nil, ErrInitFailed
 	}
-	gf := &GF16{handle: h}
-	runtime.SetFinalizer(gf, (*GF16).close)
-	return gf, nil
+	g := &GfProc{handle: h}
+	runtime.SetFinalizer(g, (*GfProc).Close)
+	return g, nil
 }
 
-func (gf *GF16) close() {
-	if gf.handle != nil {
-		C.parpar_gf16_free(gf.handle)
-		gf.handle = nil
-	}
-}
-
-// Close frees the underlying C++ resources. After Close, the GF16 must not be used.
-func (gf *GF16) Close() {
-	gf.close()
-	runtime.SetFinalizer(gf, nil)
-}
-
-// MethodName returns the name of the auto-detected SIMD method, e.g. "Shuffle (AVX2)".
-func (gf *GF16) MethodName() string {
-	return C.GoString(C.parpar_gf16_method_name(gf.handle))
-}
-
-// Alignment returns the required byte alignment for src/dst buffers.
-func (gf *GF16) Alignment() int {
-	return int(C.parpar_gf16_alignment(gf.handle))
-}
-
-// Stride returns the minimum processing granularity. Input length should be
-// a multiple of stride for optimal performance.
-func (gf *GF16) Stride() int {
-	return int(C.parpar_gf16_stride(gf.handle))
-}
-
-// Scratch holds thread-local mutable scratch memory required by some methods
-// (e.g. XOR JIT). Each goroutine calling MulAdd should use its own Scratch.
-// For methods that don't need scratch, the internal pointer is nil and this
-// is a no-op wrapper.
-type Scratch struct {
-	gf  *GF16
-	ptr unsafe.Pointer
-}
-
-// NewScratch allocates scratch memory for use with MulAdd.
-// The caller must call Free when done.
-func (gf *GF16) NewScratch() *Scratch {
-	return &Scratch{
-		gf:  gf,
-		ptr: unsafe.Pointer(C.parpar_gf16_scratch_alloc(gf.handle)),
-	}
-}
-
-// Free releases the scratch memory.
-func (s *Scratch) Free() {
-	if s.ptr != nil {
-		C.parpar_gf16_scratch_free(s.gf.handle, s.ptr)
-		s.ptr = nil
-	}
-}
-
-// MulAdd computes dst[i] ^= src[i] * coefficient in GF(2^16) for all i.
-// dst and src are treated as slices of little-endian uint16 values.
-//
-// For best performance:
-//   - len(dst) == len(src) and both should be multiples of Stride()
-//   - use a per-goroutine Scratch (from a sync.Pool)
-//
-// The C wrapper handles alignment and data format conversion (prepare/finish)
-// transparently. Non-stride-multiple remainders are handled with a Go scalar
-// fallback.
-func (gf *GF16) MulAdd(dst, src []byte, coefficient uint16, scratch *Scratch) {
-	if len(src) == 0 || coefficient == 0 {
+// SetRecoverySlices configures the output recovery blocks.
+// exponents[i] is the PAR2 exponent for the i-th recovery block;
+// standard PAR2 uses {0, 1, 2, ..., numRecovery-1}.
+// Must be called before the first Add.
+func (g *GfProc) SetRecoverySlices(exponents []uint16) {
+	if len(exponents) == 0 {
+		C.parpar_gfproc_set_recovery_slices(g.handle, nil, 0)
 		return
 	}
-
-	stride := gf.Stride()
-	n := len(src)
-	aligned := n - (n % stride)
-
-	var scratchPtr unsafe.Pointer
-	if scratch != nil {
-		scratchPtr = scratch.ptr
-	}
-
-	if aligned > 0 {
-		// The C wrapper handles alignment and prepare/finish internally.
-		C.parpar_gf16_muladd(
-			gf.handle,
-			unsafe.Pointer(&dst[0]),
-			unsafe.Pointer(&src[0]),
-			C.size_t(aligned), C.uint16_t(coefficient), scratchPtr,
-		)
-	}
-
-	// Handle remainder with scalar Go code
-	if aligned < n {
-		mulAddScalarTail(dst[aligned:], src[aligned:], coefficient)
-	}
-}
-
-// NeedsPrepare returns true if the selected SIMD method requires data to be
-// converted to an internal packed format before processing. When true, use
-// Prepare/MulAddPacked/Finish for batch operations to avoid repeated
-// alloc/copy overhead in the hot path.
-func (gf *GF16) NeedsPrepare() bool {
-	return C.parpar_gf16_needs_prepare(gf.handle) != 0
-}
-
-// Prepare converts src data to the packed format required by MulAddPacked.
-// dst must be aligned to Alignment() bytes. dst and src may be the same pointer.
-// len(dst) must equal len(src).
-func (gf *GF16) Prepare(dst, src []byte) {
-	if len(src) == 0 {
-		return
-	}
-	C.parpar_gf16_prepare(
-		gf.handle,
-		unsafe.Pointer(&dst[0]),
-		unsafe.Pointer(&src[0]),
-		C.size_t(len(src)),
+	C.parpar_gfproc_set_recovery_slices(
+		g.handle,
+		(*C.uint16_t)(unsafe.Pointer(&exponents[0])),
+		C.uint(len(exponents)),
 	)
 }
 
-// Finish converts packed data back to raw format in-place.
-// buf must be aligned to Alignment() bytes.
-func (gf *GF16) Finish(buf []byte) {
-	if len(buf) == 0 {
-		return
+// Add submits input slice sliceNum (0-based) for encoding.
+// It blocks until the prepare/transfer phase is complete (compute is async).
+// Returns the staging area state at the time of the call.
+func (g *GfProc) Add(sliceNum int, data []byte) AddResult {
+	if len(data) == 0 {
+		return AddOK
 	}
-	C.parpar_gf16_finish(
-		gf.handle,
-		unsafe.Pointer(&buf[0]),
-		C.size_t(len(buf)),
+	r := C.parpar_gfproc_add(
+		g.handle,
+		C.uint(sliceNum),
+		unsafe.Pointer(&data[0]),
+		C.size_t(len(data)),
 	)
+	return AddResult(r)
 }
 
-// MulAddPacked computes dst[i] ^= src[i] * coefficient in GF(2^16) on
-// already-prepared (packed) data. Both dst and src must be aligned to
-// Alignment() bytes. Use Prepare before calling and Finish after all
-// accumulation is complete for a given buffer.
-func (gf *GF16) MulAddPacked(dst, src []byte, coefficient uint16, scratch *Scratch) {
-	if len(src) == 0 || coefficient == 0 {
+// End signals that all inputs have been added and blocks until all compute
+// worker threads have finished. Call before GetOutput.
+func (g *GfProc) End() {
+	C.parpar_gfproc_end(g.handle)
+}
+
+// GetOutput copies the recovery block at recoveryIdx into dst.
+// dst must be at least sliceSize bytes. Blocks until the output is ready.
+// Call after End.
+func (g *GfProc) GetOutput(recoveryIdx int, dst []byte) {
+	if len(dst) == 0 {
 		return
 	}
-	var scratchPtr unsafe.Pointer
-	if scratch != nil {
-		scratchPtr = scratch.ptr
-	}
-	C.parpar_gf16_muladd_packed(
-		gf.handle,
+	C.parpar_gfproc_get_output(
+		g.handle,
+		C.uint(recoveryIdx),
 		unsafe.Pointer(&dst[0]),
-		unsafe.Pointer(&src[0]),
-		C.size_t(len(src)),
-		C.uint16_t(coefficient),
-		scratchPtr,
-	)
-}
-
-// IdealInputMultiple returns the SIMD batch size to pass as packedRegions to
-// MulAddMultiPacked. Equals idealInputMultiple from Galois16MethodInfo.
-func (gf *GF16) IdealInputMultiple() int {
-	return int(C.parpar_gf16_ideal_input_multiple(gf.handle))
-}
-
-// HasMultiPacked returns true if the hardware mul_add_multi_packed SIMD kernel
-// is available (not just the scalar fallback).
-func (gf *GF16) HasMultiPacked() bool {
-	return C.parpar_gf16_has_multi_packed(gf.handle) != 0
-}
-
-// MulAddMultiPacked accumulates N prepared input slices (laid contiguously in
-// srcPacked) into a single dst recovery block in one CGo call.
-//
-//   - srcPacked must be len(dst)*regions bytes: srcPacked[j*sliceLen..(j+1)*sliceLen]
-//     is the j-th prepared input slice.
-//   - dst must be an AlignedSlice of sliceLen bytes.
-//   - regions is the number of input slices (N).
-//   - packedRegions should be IdealInputMultiple() for best SIMD utilization.
-//   - coefficients must have length >= regions.
-func (gf *GF16) MulAddMultiPacked(dst, srcPacked []byte, regions, packedRegions int,
-	coefficients []uint16, scratch *Scratch) {
-	if regions == 0 || len(dst) == 0 {
-		return
-	}
-	var scratchPtr unsafe.Pointer
-	if scratch != nil {
-		scratchPtr = scratch.ptr
-	}
-	C.parpar_gf16_muladd_multi_packed(
-		gf.handle,
-		unsafe.Pointer(&dst[0]),
-		unsafe.Pointer(&srcPacked[0]),
-		C.uint(regions), C.uint(packedRegions),
 		C.size_t(len(dst)),
-		(*C.uint16_t)(unsafe.Pointer(&coefficients[0])),
-		scratchPtr,
 	)
 }
 
-// MulAddPackedMulti accumulates one prepared src into multiple dst buffers
-// in a single CGo call, reducing per-buffer CGo overhead from O(N) to O(1).
-// All dst buffers and src must be aligned to Alignment() bytes.
-// coefficients[i] == 0 entries are skipped.
-func (gf *GF16) MulAddPackedMulti(dsts [][]byte, src []byte, coefficients []uint16, scratch *Scratch) {
-	if len(src) == 0 || len(dsts) == 0 {
-		return
-	}
-	// Build a contiguous slice of dst pointers (all point to C-allocated memory).
-	ptrs := make([]unsafe.Pointer, len(dsts))
-	for i, d := range dsts {
-		if len(d) > 0 {
-			ptrs[i] = unsafe.Pointer(&d[0])
-		}
-	}
-	var scratchPtr unsafe.Pointer
-	if scratch != nil {
-		scratchPtr = scratch.ptr
-	}
-	C.parpar_gf16_muladd_packed_multi(
-		gf.handle,
-		unsafe.Pointer(&ptrs[0]),
-		C.size_t(len(dsts)),
-		unsafe.Pointer(&src[0]),
-		(*C.uint16_t)(unsafe.Pointer(&coefficients[0])),
-		C.size_t(len(src)),
-		scratchPtr,
-	)
+// FreeMem releases the internal processing (output) buffer.
+// Call after all outputs have been retrieved to reclaim memory.
+func (g *GfProc) FreeMem() {
+	C.parpar_gfproc_free_mem(g.handle)
 }
 
-// mulAddScalarTail handles the tail bytes that don't fill a full stride.
-// It uses log/exp table lookups, same algorithm as the pure-Go fallback.
-func mulAddScalarTail(dst, src []byte, factor uint16) {
-	logFactor := logTable[factor]
-	for i := 0; i+1 < len(src); i += 2 {
-		val := uint16(src[i]) | uint16(src[i+1])<<8
-		if val == 0 {
-			continue
-		}
-		product := expTable[uint32(logTable[val])+uint32(logFactor)]
-		dst[i] ^= byte(product)
-		dst[i+1] ^= byte(product >> 8)
+// MethodName returns the name of the auto-detected SIMD method,
+// e.g. "Shuffle (AVX2)" or "CLMul (NEON)".
+func (g *GfProc) MethodName() string {
+	return C.GoString(C.parpar_gfproc_method_name(g.handle))
+}
+
+// NumThreads returns the number of active GF compute worker threads.
+func (g *GfProc) NumThreads() int {
+	return int(C.parpar_gfproc_num_threads(g.handle))
+}
+
+// Close frees all C++ resources. After Close the GfProc must not be used.
+func (g *GfProc) Close() {
+	if g.handle != nil {
+		C.parpar_gfproc_free(g.handle)
+		g.handle = nil
 	}
+	runtime.SetFinalizer(g, nil)
 }
 
-// GF(2^16) log/exp tables for scalar tail processing.
-// These are identical to the tables in the gf16 package.
-const (
-	gf16Polynomial = 0x1100B
-)
-
-var (
-	logTable [65536]uint16
-	expTable [2 * 65535]uint16
-	initOnce sync.Once
-)
-
-func init() {
-	initOnce.Do(buildTables)
-}
-
-func buildTables() {
-	var val uint32 = 1
-	for i := 0; i < 65535; i++ {
-		expTable[i] = uint16(val)
-		expTable[i+65535] = uint16(val)
-		logTable[val] = uint16(i)
-		val <<= 1
-		if val&0x10000 != 0 {
-			val ^= gf16Polynomial
-		}
-	}
-}
-
-// AlignedSlice allocates a byte slice of the given size with memory aligned
-// to the SIMD requirements of this GF16 instance. Using aligned slices with
-// MulAdd avoids the overhead of copying through aligned temporaries.
-// The returned slice must be freed with FreeAligned when no longer needed.
-func (gf *GF16) AlignedSlice(size int) []byte {
-	alignment := gf.Alignment()
-	ptr := C.parpar_aligned_alloc(C.size_t(alignment), C.size_t(size))
-	if ptr == nil {
-		return nil
-	}
-	C.memset(ptr, 0, C.size_t(size))
-	return unsafe.Slice((*byte)(ptr), size)
-}
-
-// FreeAligned frees a slice previously allocated with AlignedSlice.
-func FreeAligned(b []byte) {
-	if len(b) > 0 {
-		C.parpar_aligned_free(unsafe.Pointer(&b[0]))
-	}
-}
-
-// ErrInitFailed is returned when ParPar GF16 initialization fails.
+// ErrInitFailed is returned when PAR2ProcCPU initialization fails.
 type ErrType string
 
 func (e ErrType) Error() string { return string(e) }
 
-const ErrInitFailed = ErrType("parpar: failed to initialize GF16 multiplier")
+const ErrInitFailed = ErrType("parpar: failed to initialize PAR2ProcCPU")

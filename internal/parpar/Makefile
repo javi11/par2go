@@ -127,7 +127,9 @@ RVV_ZVBC_FLAGS := $(call check_flag,$(CC),-march=rv64gcv_zvbc1)
 # C++ sources
 CXX_SRCS := \
 	$(GF16DIR)/gf16mul.cpp \
-	csrc/wrapper.cpp
+	$(GF16DIR)/controller.cpp \
+	$(GF16DIR)/controller_cpu.cpp \
+	csrc/bridge.cpp
 
 # ============================================================================
 # Build architecture-specific object lists
@@ -140,7 +142,11 @@ GENERIC_OBJS := $(patsubst $(VENDOR)/%,$(BUILDDIR)/%.o,$(GENERIC_SRCS))
 ALL_OBJS += $(GENERIC_OBJS)
 
 # C++ objects (always built)
-CXX_OBJS := $(BUILDDIR)/gf16mul.cpp.o $(BUILDDIR)/wrapper.cpp.o
+CXX_OBJS := \
+	$(BUILDDIR)/gf16mul.cpp.o \
+	$(BUILDDIR)/controller.cpp.o \
+	$(BUILDDIR)/controller_cpu.cpp.o \
+	$(BUILDDIR)/bridge.cpp.o
 ALL_OBJS += $(CXX_OBJS)
 
 ifeq ($(ARCH),x86_64)
@@ -324,7 +330,13 @@ $(BUILDDIR)/gf16/gf16_clmul_rvv.c.o: $(GF16DIR)/gf16_clmul_rvv.c | $(BUILDDIR)/g
 $(BUILDDIR)/gf16mul.cpp.o: $(GF16DIR)/gf16mul.cpp | $(BUILDDIR)/gf16
 	$(CXX) $(CXXFLAGS_COMMON) $(DEFINES) -c -o $@ $<
 
-$(BUILDDIR)/wrapper.cpp.o: csrc/wrapper.cpp | $(BUILDDIR)/gf16
+$(BUILDDIR)/controller.cpp.o: $(GF16DIR)/controller.cpp | $(BUILDDIR)/gf16
+	$(CXX) $(CXXFLAGS_COMMON) $(DEFINES) -c -o $@ $<
+
+$(BUILDDIR)/controller_cpu.cpp.o: $(GF16DIR)/controller_cpu.cpp | $(BUILDDIR)/gf16
+	$(CXX) $(CXXFLAGS_COMMON) $(DEFINES) -c -o $@ $<
+
+$(BUILDDIR)/bridge.cpp.o: csrc/bridge.cpp | $(BUILDDIR)/gf16
 	$(CXX) $(CXXFLAGS_COMMON) $(DEFINES) -I. -c -o $@ $<
 
 # ============================================================================

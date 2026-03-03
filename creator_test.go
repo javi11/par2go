@@ -10,10 +10,81 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/javi11/par2go/internal/gf16"
 	"github.com/javi11/par2go/internal/packets"
-	"github.com/javi11/par2go/internal/rsenc"
 )
+
+// --- Inline GF(2^16) helpers for recovery math validation ---
+//
+// Uses PAR2 primitive polynomial x^16 + x^12 + x^3 + x + 1 (0x1100B).
+// These replicate the exact field used by ParPar internally.
+
+var (
+	testGFLog [65536]uint16
+	testGFExp [131070]uint16 // doubled: exp[i] == exp[i % 65535]
+)
+
+func init() {
+	x := uint32(1)
+	for i := 0; i < 65535; i++ {
+		testGFExp[i] = uint16(x)
+		testGFLog[x] = uint16(i)
+		x <<= 1
+		if x >= 65536 {
+			x ^= 0x1100B
+		}
+	}
+	copy(testGFExp[65535:], testGFExp[:65535])
+}
+
+func testGFPow(base, exp uint16) uint16 {
+	if exp == 0 {
+		return 1
+	}
+	if base == 0 {
+		return 0
+	}
+	return testGFExp[(uint32(testGFLog[base])*uint32(exp))%65535]
+}
+
+func testGFInv(x uint16) uint16 {
+	if x <= 1 {
+		return x
+	}
+	return testGFExp[65535-uint32(testGFLog[x])]
+}
+
+func testGFMulAccumulate(dst, src []byte, factor uint16) {
+	if factor == 0 {
+		return
+	}
+	logF := uint32(testGFLog[factor])
+	for i := 0; i+1 < len(src); i += 2 {
+		val := uint16(src[i]) | uint16(src[i+1])<<8
+		if val == 0 {
+			continue
+		}
+		product := testGFExp[uint32(testGFLog[val])+logF]
+		dst[i] ^= byte(product)
+		dst[i+1] ^= byte(product >> 8)
+	}
+}
+
+// testGenerateConstants returns the PAR2 generator constants:
+// successive powers of 2 in GF(2^16), skipping exponents divisible by 3, 5, 17, or 257.
+func testGenerateConstants(n int) []uint16 {
+	constants := make([]uint16, 0, n)
+	k := 0
+	for len(constants) < n {
+		if k%3 != 0 && k%5 != 0 && k%17 != 0 && k%257 != 0 {
+			constants = append(constants, testGFPow(2, uint16(k)))
+		}
+		k++
+		if k > 65535 {
+			break
+		}
+	}
+	return constants
+}
 
 func TestCreateBasic(t *testing.T) {
 	// Create a temp directory
@@ -652,7 +723,7 @@ func TestCreateAndRecoverCorruptedSlice(t *testing.T) {
 	}
 
 	numInputSlices := (fileSize + sliceSize - 1) / sliceSize
-	constants := rsenc.GenerateConstants(numInputSlices)
+	constants := testGenerateConstants(numInputSlices)
 
 	// getSlice returns the i-th input slice, zero-padded to sliceSize.
 	getSlice := func(i int) []byte {
@@ -692,14 +763,14 @@ func TestCreateAndRecoverCorruptedSlice(t *testing.T) {
 					if i == corruptedIdx {
 						continue
 					}
-					factor := gf16.Pow(constants[i], rec.exponent)
-					gf16.MulAccumulate(intermediate, getSlice(i), factor)
+					factor := testGFPow(constants[i], rec.exponent)
+					testGFMulAccumulate(intermediate, getSlice(i), factor)
 				}
 
-				corruptedFactor := gf16.Pow(constants[corruptedIdx], rec.exponent)
-				invFactor := gf16.Inv(corruptedFactor)
+				corruptedFactor := testGFPow(constants[corruptedIdx], rec.exponent)
+				invFactor := testGFInv(corruptedFactor)
 				recovered := make([]byte, sliceSize)
-				gf16.MulAccumulate(recovered, intermediate, invFactor)
+				testGFMulAccumulate(recovered, intermediate, invFactor)
 
 				originalSlice := getSlice(corruptedIdx)
 				if !bytes.Equal(recovered, originalSlice) {
