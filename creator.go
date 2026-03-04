@@ -25,6 +25,9 @@ import (
 	"github.com/javi11/par2go/internal/parpar"
 )
 
+// discardHandler is a no-op slog handler used as the default logger for the library.
+var discardHandler = slog.New(slog.NewTextHandler(io.Discard, nil))
+
 // Options configures PAR2 creation.
 type Options struct {
 	// SliceSize is the block/slice size in bytes. Must be a multiple of 4.
@@ -38,6 +41,9 @@ type Options struct {
 	OnProgress func(phase string, pct float64)
 	// Creator is the creator string embedded in the PAR2 file (default: "Postie").
 	Creator string
+	// Logger is the structured logger used internally. Defaults to discarding all output.
+	// Set to slog.Default() or a custom *slog.Logger to enable logging.
+	Logger *slog.Logger
 }
 
 func (o *Options) withDefaults() Options {
@@ -47,6 +53,9 @@ func (o *Options) withDefaults() Options {
 	}
 	if opts.Creator == "" {
 		opts.Creator = "Postie"
+	}
+	if opts.Logger == nil {
+		opts.Logger = discardHandler
 	}
 	return opts
 }
@@ -101,7 +110,7 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 
 	// Phase 1: Quick scan — stat + read first 16KB per file in parallel.
 	// Provides hash16k, size, and fileID needed for the Main packet.
-	slog.Debug("par2go: scanning input files", "count", len(inputFiles))
+	opts.Logger.Debug("par2go: scanning input files", "count", len(inputFiles))
 	report("hashing", 0)
 
 	files, err := quickScanFiles(ctx, inputFiles)
@@ -125,7 +134,7 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	// Each file is read exactly once: hashFull and IFSC are computed while
 	// simultaneously feeding the RS encoder.  IFSC computation is offloaded
 	// to a pool of goroutines to overlap with I/O and GF16 compute.
-	slog.Debug("par2go: encoding recovery blocks",
+	opts.Logger.Debug("par2go: encoding recovery blocks",
 		"numRecovery", opts.NumRecovery,
 		"sliceSize", opts.SliceSize)
 
@@ -135,7 +144,7 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	}
 	defer proc.Close()
 
-	slog.Debug("par2go: encoder ready", "method", proc.MethodName(), "threads", proc.NumThreads())
+	opts.Logger.Debug("par2go: encoder ready", "method", proc.MethodName(), "threads", proc.NumThreads())
 
 	exponents := make([]uint16, opts.NumRecovery)
 	for i := range exponents {
@@ -171,7 +180,7 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	report("encoding", 1.0)
 
 	// Phase 4: Write output files (volume files written in parallel).
-	slog.Debug("par2go: writing PAR2 files", "output", outputPath)
+	opts.Logger.Debug("par2go: writing PAR2 files", "output", outputPath)
 	report("writing", 0)
 
 	if err := writeMainFile(outputPath, recoverySetID, mainBody, files, opts.Creator); err != nil {
@@ -182,7 +191,7 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	}
 
 	report("writing", 1.0)
-	slog.Debug("par2go: done")
+	opts.Logger.Debug("par2go: done")
 	return nil
 }
 
