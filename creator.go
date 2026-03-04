@@ -19,10 +19,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/javi11/par2go/internal/packets"
 	"github.com/javi11/par2go/internal/parpar"
 )
+
+// discardHandler is a no-op slog handler used as the default logger for the library.
+var discardHandler = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 // Options configures PAR2 creation.
 type Options struct {
@@ -37,6 +41,9 @@ type Options struct {
 	OnProgress func(phase string, pct float64)
 	// Creator is the creator string embedded in the PAR2 file (default: "Postie").
 	Creator string
+	// Logger is the structured logger used internally. Defaults to discarding all output.
+	// Set to slog.Default() or a custom *slog.Logger to enable logging.
+	Logger *slog.Logger
 }
 
 func (o *Options) withDefaults() Options {
@@ -46,6 +53,9 @@ func (o *Options) withDefaults() Options {
 	}
 	if opts.Creator == "" {
 		opts.Creator = "Postie"
+	}
+	if opts.Logger == nil {
+		opts.Logger = discardHandler
 	}
 	return opts
 }
@@ -65,6 +75,14 @@ type fileInfo struct {
 	hashFull [16]byte // MD5 of entire file
 	fileID   [16]byte
 	slices   []packets.IFSCEntry
+}
+
+// fileNumSlices returns the number of PAR2 slices for a file of the given size.
+func fileNumSlices(size uint64, sliceSize int) int {
+	if size == 0 {
+		return 0
+	}
+	return int((size + uint64(sliceSize) - 1) / uint64(sliceSize))
 }
 
 // Create creates PAR2 parity files for the given input files.
@@ -90,55 +108,35 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 		}
 	}
 
-	// Phase 1: Hash input files and compute per-slice checksums
-	slog.Debug("par2go: hashing input files", "count", len(inputFiles))
+	// Phase 1: Quick scan — stat + read first 16KB per file in parallel.
+	// Provides hash16k, size, and fileID needed for the Main packet.
+	opts.Logger.Debug("par2go: scanning input files", "count", len(inputFiles))
 	report("hashing", 0)
 
-	files, err := hashFiles(ctx, inputFiles, opts.SliceSize, func(pct float64) {
-		report("hashing", pct)
-	})
+	files, err := quickScanFiles(ctx, inputFiles)
 	if err != nil {
-		return fmt.Errorf("par2go: hashing failed: %w", err)
+		return fmt.Errorf("par2go: scanning failed: %w", err)
 	}
 
-	report("hashing", 1.0)
-
-	// Phase 2: Build Main packet and derive Recovery Set ID
+	// Phase 2: Build Main packet and derive Recovery Set ID.
 	fileIDs := make([][16]byte, len(files))
 	for i, f := range files {
 		fileIDs[i] = f.fileID
 	}
-
 	// PAR2 spec requires file IDs sorted by value (unsigned 128-bit integer).
 	slices.SortFunc(fileIDs, func(a, b [16]byte) int {
 		return bytes.Compare(a[:], b[:])
 	})
-
 	mainBody := packets.MainPacket(uint64(opts.SliceSize), fileIDs)
 	recoverySetID := packets.RecoverySetID(mainBody)
 
-	// Phase 3: RS encode recovery blocks via PAR2ProcCPU
-	slog.Debug("par2go: encoding recovery blocks",
+	// Phase 3: Single-pass hash+encode.
+	// Each file is read exactly once: hashFull and IFSC are computed while
+	// simultaneously feeding the RS encoder.  IFSC computation is offloaded
+	// to a pool of goroutines to overlap with I/O and GF16 compute.
+	opts.Logger.Debug("par2go: encoding recovery blocks",
 		"numRecovery", opts.NumRecovery,
 		"sliceSize", opts.SliceSize)
-
-	// Build a flat list of all input slices across files
-	type sliceRef struct {
-		fileIdx  int
-		sliceIdx int
-	}
-	var allSlices []sliceRef
-	for fi, f := range files {
-		numSlices := int((f.size + uint64(opts.SliceSize) - 1) / uint64(opts.SliceSize))
-		for s := range numSlices {
-			allSlices = append(allSlices, sliceRef{fileIdx: fi, sliceIdx: s})
-		}
-	}
-
-	totalInputSlices := len(allSlices)
-	if totalInputSlices == 0 {
-		return fmt.Errorf("par2go: no input slices (all files empty?)")
-	}
 
 	proc, err := parpar.NewGfProc(opts.SliceSize, opts.NumGoroutines)
 	if err != nil {
@@ -146,7 +144,7 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	}
 	defer proc.Close()
 
-	slog.Debug("par2go: encoder ready", "method", proc.MethodName(), "threads", proc.NumThreads())
+	opts.Logger.Debug("par2go: encoder ready", "method", proc.MethodName(), "threads", proc.NumThreads())
 
 	exponents := make([]uint16, opts.NumRecovery)
 	for i := range exponents {
@@ -154,54 +152,13 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	}
 	proc.SetRecoverySlices(exponents)
 
-	// Open all input files upfront to avoid repeated open/close per slice
-	openFiles := make([]*os.File, len(files))
-	for i, fi := range files {
-		f, err := os.Open(fi.path)
-		if err != nil {
-			for j := 0; j < i; j++ {
-				_ = openFiles[j].Close()
-			}
-			return fmt.Errorf("par2go: open %s: %w", fi.path, err)
-		}
-		openFiles[i] = f
-	}
-	defer func() {
-		for _, f := range openFiles {
-			_ = f.Close()
-		}
-	}()
-
-	// Buffer pool to reuse slice-sized buffers across readSlice calls
-	bufPool := sync.Pool{
-		New: func() any {
-			b := make([]byte, opts.SliceSize)
-			return &b
-		},
+	if err := hashAndEncodeFiles(ctx, files, proc, opts.SliceSize, func(pct float64) {
+		report("hashing", pct)
+	}); err != nil {
+		return fmt.Errorf("par2go: hash+encode failed: %w", err)
 	}
 
-	// Feed all input slices to the encoder
-	for i, ref := range allSlices {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		ptr := bufPool.Get().(*[]byte)
-		buf := *ptr
-		n, readErr := openFiles[ref.fileIdx].ReadAt(buf, int64(ref.sliceIdx)*int64(opts.SliceSize))
-		if readErr != nil && readErr != io.EOF {
-			bufPool.Put(ptr)
-			return fmt.Errorf("par2go: read slice %d: %w", i, readErr)
-		}
-		if n < len(buf) {
-			clear(buf[n:])
-		}
-
-		proc.Add(i, buf)
-		bufPool.Put(ptr)
-
-		report("encoding", float64(i+1)/float64(totalInputSlices))
-	}
+	report("hashing", 1.0)
 
 	if err := ctx.Err(); err != nil {
 		return err
@@ -209,7 +166,7 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 
 	proc.End()
 
-	// Collect recovery blocks
+	// Collect recovery blocks.
 	recoveryBlocks := make([]recoveryBlock, opts.NumRecovery)
 	for i := range recoveryBlocks {
 		recoveryBlocks[i] = recoveryBlock{
@@ -222,67 +179,24 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 
 	report("encoding", 1.0)
 
-	// Phase 4: Write output files
-	slog.Debug("par2go: writing PAR2 files", "output", outputPath)
+	// Phase 4: Write output files (volume files written in parallel).
+	opts.Logger.Debug("par2go: writing PAR2 files", "output", outputPath)
 	report("writing", 0)
 
-	// 4a: Write main .par2 file (no recovery data, just metadata packets)
 	if err := writeMainFile(outputPath, recoverySetID, mainBody, files, opts.Creator); err != nil {
 		return fmt.Errorf("par2go: writing main file failed: %w", err)
 	}
-
-	// 4b: Write volume files with doubling strategy
 	if err := writeVolumeFiles(outputPath, recoverySetID, recoveryBlocks, opts.SliceSize); err != nil {
 		return fmt.Errorf("par2go: writing volume files failed: %w", err)
 	}
 
 	report("writing", 1.0)
-	slog.Debug("par2go: done")
-
+	opts.Logger.Debug("par2go: done")
 	return nil
 }
 
-// hashFiles computes hashes and per-slice checksums for all input files.
-func hashFiles(ctx context.Context, paths []string, sliceSize int, onProgress func(float64)) ([]fileInfo, error) {
-	var totalSize int64
-	for _, p := range paths {
-		info, err := os.Stat(p)
-		if err != nil {
-			return nil, fmt.Errorf("stat %s: %w", p, err)
-		}
-		totalSize += info.Size()
-	}
-
-	var processedSize int64
-	files := make([]fileInfo, len(paths))
-
-	for i, p := range paths {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		fi, err := hashSingleFile(ctx, p, sliceSize, func(bytesRead int64) {
-			if totalSize > 0 {
-				onProgress(float64(processedSize+bytesRead) / float64(totalSize))
-			}
-		})
-		if err != nil {
-			return nil, err
-		}
-		files[i] = fi
-
-		processedSize += int64(fi.size)
-		if totalSize > 0 {
-			onProgress(float64(processedSize) / float64(totalSize))
-		}
-	}
-
-	return files, nil
-}
-
-// hashSingleFile computes all hashes and checksums for a single file.
-// onProgress is called after each slice with the total bytes read so far.
-func hashSingleFile(ctx context.Context, path string, sliceSize int, onProgress func(bytesRead int64)) (fileInfo, error) {
+// quickScanFile reads file metadata and the first 16KB to compute hash16k and fileID.
+func quickScanFile(path string) (fileInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return fileInfo{}, fmt.Errorf("open %s: %w", path, err)
@@ -291,7 +205,7 @@ func hashSingleFile(ctx context.Context, path string, sliceSize int, onProgress 
 
 	stat, err := f.Stat()
 	if err != nil {
-		return fileInfo{}, err
+		return fileInfo{}, fmt.Errorf("stat %s: %w", path, err)
 	}
 
 	fi := fileInfo{
@@ -300,74 +214,248 @@ func hashSingleFile(ctx context.Context, path string, sliceSize int, onProgress 
 		size: uint64(stat.Size()),
 	}
 
-	// Compute all hashes in a single pass
-	hashFull := md5.New()
-	hash16k := md5.New()
-
-	numSlices := int((fi.size + uint64(sliceSize) - 1) / uint64(sliceSize))
-	if fi.size == 0 {
-		numSlices = 0
-	}
-	fi.slices = make([]packets.IFSCEntry, numSlices)
-
-	buf := make([]byte, sliceSize)
-	var totalRead int64
-	sliceIdx := 0
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return fileInfo{}, err
+	if stat.Size() > 0 {
+		readSize := stat.Size()
+		if readSize > 16384 {
+			readSize = 16384
 		}
-
-		n, err := io.ReadFull(f, buf)
-		if n == 0 {
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				return fileInfo{}, fmt.Errorf("read %s: %w", path, err)
-			}
+		buf := make([]byte, readSize)
+		if _, err := io.ReadFull(f, buf); err != nil {
+			return fileInfo{}, fmt.Errorf("read16k %s: %w", path, err)
 		}
-
-		slice := buf[:n]
-
-		// Full file hash
-		hashFull.Write(slice)
-
-		// 16K hash
-		if totalRead < 16384 {
-			end := int64(n)
-			if totalRead+end > 16384 {
-				end = 16384 - totalRead
-			}
-			hash16k.Write(slice[:end])
-		}
-
-		// Per-slice checksums (pad last slice with zeros)
-		if n < sliceSize {
-			padded := make([]byte, sliceSize)
-			copy(padded, slice)
-			slice = padded
-		}
-		fi.slices[sliceIdx] = packets.IFSCEntry{
-			MD5:   md5.Sum(slice),
-			CRC32: crc32Sum(slice),
-		}
-		sliceIdx++
-
-		totalRead += int64(n)
-		onProgress(totalRead)
-
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
-		}
+		fi.hash16k = md5.Sum(buf)
 	}
 
-	copy(fi.hashFull[:], hashFull.Sum(nil))
-	copy(fi.hash16k[:], hash16k.Sum(nil))
 	fi.fileID = packets.FileID(fi.hash16k, fi.size, fi.name)
-
 	return fi, nil
+}
+
+// quickScanFiles runs quickScanFile on all paths concurrently.
+func quickScanFiles(ctx context.Context, paths []string) ([]fileInfo, error) {
+	files := make([]fileInfo, len(paths))
+	errc := make(chan error, len(paths))
+
+	var wg sync.WaitGroup
+	for i, p := range paths {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		wg.Add(1)
+		go func(i int, p string) {
+			defer wg.Done()
+			fi, err := quickScanFile(p)
+			if err != nil {
+				errc <- err
+				return
+			}
+			files[i] = fi
+		}(i, p)
+	}
+	wg.Wait()
+	close(errc)
+	for err := range errc {
+		return nil, err
+	}
+	return files, nil
+}
+
+// hashAndEncodeFiles performs a single pass over all input files:
+//   - Reader goroutines (one per file, bounded by numCPU) read slices from disk,
+//     update hashFull incrementally, and call proc.Add inline.
+//   - A pool of IFSC hash goroutines computes per-slice MD5+CRC32 concurrently,
+//     overlapping with I/O and GF16 compute.
+//
+// This eliminates the double-read and decouples slow per-slice hashing from I/O.
+func hashAndEncodeFiles(
+	ctx context.Context,
+	files []fileInfo,
+	proc *parpar.GfProc,
+	sliceSize int,
+	onProgress func(float64),
+) error {
+	// Pre-assign global slice offsets per file.
+	offsets := make([]int, len(files))
+	totalSlices := 0
+	for i := range files {
+		offsets[i] = totalSlices
+		totalSlices += fileNumSlices(files[i].size, sliceSize)
+	}
+	if totalSlices == 0 {
+		return fmt.Errorf("par2go: no input slices (all files empty?)")
+	}
+
+	// Pre-allocate IFSC slice arrays so hash workers can write directly.
+	for i := range files {
+		n := fileNumSlices(files[i].size, sliceSize)
+		if n > 0 {
+			files[i].slices = make([]packets.IFSCEntry, n)
+		}
+	}
+
+	// Open all files upfront.
+	openFiles := make([]*os.File, len(files))
+	for i := range files {
+		f, err := os.Open(files[i].path)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = openFiles[j].Close()
+			}
+			return fmt.Errorf("par2go: open %s: %w", files[i].path, err)
+		}
+		openFiles[i] = f
+	}
+	defer func() {
+		for _, f := range openFiles {
+			_ = f.Close()
+		}
+	}()
+
+	// Buffer pool: reuses slice-sized buffers across all goroutines.
+	bufPool := &sync.Pool{
+		New: func() any {
+			b := make([]byte, sliceSize)
+			return &b
+		},
+	}
+
+	// IFSC hash pool: per-slice MD5+CRC32 runs concurrently with I/O and GF16.
+	// Decoupling this from the reader goroutine lets I/O proceed at full speed.
+	numHashWorkers := runtime.NumCPU() / 2
+	if numHashWorkers < 1 {
+		numHashWorkers = 1
+	}
+	if numHashWorkers > 8 {
+		numHashWorkers = 8
+	}
+
+	type hashWork struct {
+		bptr     *[]byte
+		fileIdx  int
+		sliceIdx int
+	}
+
+	hashCh := make(chan hashWork, numHashWorkers*4)
+
+	var hashWg sync.WaitGroup
+	for j := 0; j < numHashWorkers; j++ {
+		hashWg.Add(1)
+		go func() {
+			defer hashWg.Done()
+			for hw := range hashCh {
+				buf := *hw.bptr
+				files[hw.fileIdx].slices[hw.sliceIdx] = packets.IFSCEntry{
+					MD5:   md5.Sum(buf),
+					CRC32: crc32Sum(buf),
+				}
+				bufPool.Put(hw.bptr)
+			}
+		}()
+	}
+
+	// Reader goroutines: read slices, update hashFull, call proc.Add inline.
+	// proc.Add is safe for concurrent calls from multiple goroutines.
+	numReaders := len(files)
+	if numReaders > runtime.NumCPU() {
+		numReaders = runtime.NumCPU()
+	}
+	if numReaders < 1 {
+		numReaders = 1
+	}
+	sem := make(chan struct{}, numReaders)
+
+	var readerErrs []error
+	var readerMu sync.Mutex
+	var readerWg sync.WaitGroup
+	var doneSlices atomic.Int64
+
+	for i := range files {
+		readerWg.Add(1)
+		go func(i int) {
+			defer readerWg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			fi := &files[i]
+			f := openFiles[i]
+			hashFull := md5.New()
+			sliceIdx := 0
+
+			for {
+				if err := ctx.Err(); err != nil {
+					readerMu.Lock()
+					readerErrs = append(readerErrs, err)
+					readerMu.Unlock()
+					return
+				}
+
+				bptr := bufPool.Get().(*[]byte)
+				buf := *bptr
+
+				n, err := io.ReadFull(f, buf)
+				if n == 0 {
+					bufPool.Put(bptr)
+					if err == io.EOF {
+						break
+					}
+					readerMu.Lock()
+					readerErrs = append(readerErrs, fmt.Errorf("read %s: %w", fi.path, err))
+					readerMu.Unlock()
+					return
+				}
+
+				// Hash only actual file bytes (not zero-padding).
+				hashFull.Write(buf[:n])
+
+				// Zero-pad last partial slice for encoding and IFSC.
+				if n < sliceSize {
+					clear(buf[n:])
+				}
+
+				// Feed encoder inline — no channel round-trip needed.
+				// proc.Add is concurrency-safe across goroutines.
+				proc.Add(offsets[i]+sliceIdx, buf)
+
+				// Delegate per-slice IFSC hashing to the hash pool.
+				// The buffer is still valid; hash workers own it until they put it back.
+				hw := hashWork{bptr: bptr, fileIdx: i, sliceIdx: sliceIdx}
+				select {
+				case hashCh <- hw:
+				case <-ctx.Done():
+					bufPool.Put(bptr)
+					readerMu.Lock()
+					readerErrs = append(readerErrs, ctx.Err())
+					readerMu.Unlock()
+					return
+				}
+
+				sliceIdx++
+				done := doneSlices.Add(1)
+				onProgress(float64(done) / float64(totalSlices))
+
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					break
+				}
+			}
+
+			copy(fi.hashFull[:], hashFull.Sum(nil))
+		}(i)
+	}
+
+	// Close hash channel once all readers are done so hash workers can exit.
+	readerWg.Wait()
+	close(hashCh)
+	hashWg.Wait()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	readerMu.Lock()
+	defer readerMu.Unlock()
+	if len(readerErrs) > 0 {
+		return readerErrs[0]
+	}
+	return nil
 }
 
 // writeMainFile writes the main .par2 file containing metadata packets.
@@ -378,18 +466,15 @@ func writeMainFile(outputPath string, recoverySetID [16]byte, mainBody []byte, f
 	}
 	defer func() { _ = f.Close() }()
 
-	// Write Main packet
 	if err := packets.WriteHeader(f, recoverySetID, packets.TypeMain, mainBody); err != nil {
 		return err
 	}
 
-	// Write Creator packet
 	creatorBody := packets.CreatorPacket(creator)
 	if err := packets.WriteHeader(f, recoverySetID, packets.TypeCreator, creatorBody); err != nil {
 		return err
 	}
 
-	// Write File Description + IFSC packets for each file
 	for _, fi := range files {
 		fdBody := packets.FileDescriptionPacket(fi.fileID, fi.hashFull, fi.hash16k, fi.size, fi.name)
 		if err := packets.WriteHeader(f, recoverySetID, packets.TypeFileDescription, fdBody); err != nil {
@@ -405,23 +490,29 @@ func writeMainFile(outputPath string, recoverySetID [16]byte, mainBody []byte, f
 	return f.Close()
 }
 
-// writeVolumeFiles writes .volN+M.par2 files using a doubling strategy.
+// writeVolumeFiles writes .volN+M.par2 files using a doubling strategy,
+// with volume files written in parallel (bounded by numCPU).
+//
 // Block counts per volume: 1, 1, 2, 4, 8, 16, ... until all blocks are placed.
 func writeVolumeFiles(outputPath string, recoverySetID [16]byte, blocks []recoveryBlock, sliceSize int) error {
 	if len(blocks) == 0 {
 		return nil
 	}
 
-	// Sort blocks by exponent
 	sort.Slice(blocks, func(i, j int) bool {
 		return blocks[i].exponent < blocks[j].exponent
 	})
 
-	// Strip .par2 extension for volume file naming
 	base := strings.TrimSuffix(outputPath, filepath.Ext(outputPath))
 
+	type volGroup struct {
+		name   string
+		blocks []recoveryBlock
+	}
+	var groups []volGroup
+
 	offset := 0
-	count := 1 // Start with 1, then 1, 2, 4, 8, ...
+	count := 1
 	firstVolume := true
 
 	for offset < len(blocks) {
@@ -429,25 +520,44 @@ func writeVolumeFiles(outputPath string, recoverySetID [16]byte, blocks []recove
 		if end > len(blocks) {
 			end = len(blocks)
 		}
-
 		actualCount := end - offset
 		volName := fmt.Sprintf("%s.vol%02d+%02d.par2", base, offset, actualCount)
-
-		if err := writeVolumeFile(volName, recoverySetID, blocks[offset:end]); err != nil {
-			return err
-		}
-
+		groups = append(groups, volGroup{name: volName, blocks: blocks[offset:end]})
 		offset = end
 
-		// Doubling: first two volumes have 1 block each, then 2, 4, 8, ...
 		if firstVolume {
 			firstVolume = false
-			// count stays 1 for second volume
 		} else {
 			count *= 2
 		}
 	}
 
+	// Write all volume files concurrently.
+	numWorkers := len(groups)
+	if numWorkers > runtime.NumCPU() {
+		numWorkers = runtime.NumCPU()
+	}
+	sem := make(chan struct{}, numWorkers)
+	errc := make(chan error, len(groups))
+
+	var wg sync.WaitGroup
+	for _, g := range groups {
+		wg.Add(1)
+		go func(g volGroup) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if err := writeVolumeFile(g.name, recoverySetID, g.blocks); err != nil {
+				errc <- err
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errc)
+
+	for err := range errc {
+		return err
+	}
 	return nil
 }
 
