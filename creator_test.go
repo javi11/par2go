@@ -316,6 +316,43 @@ func BenchmarkCreate1MB(b *testing.B) {
 	}
 }
 
+func BenchmarkCreate100MB(b *testing.B) {
+	const fileSize = 100 * 1024 * 1024 // 100 MB
+
+	// Create test file once outside the timed loop.
+	tmpDir := b.TempDir()
+	inputPath := filepath.Join(tmpDir, "bench.bin")
+	data := make([]byte, fileSize)
+	for i := range data {
+		data[i] = byte(i*7 + 13)
+	}
+	if err := os.WriteFile(inputPath, data, 0644); err != nil {
+		b.Fatal(err)
+	}
+
+	outputPath := filepath.Join(tmpDir, "bench.par2")
+	opts := Options{
+		SliceSize:   768 * 1024, // 768 KB — matches real-world PAR2 usage
+		NumRecovery: 10,
+	}
+
+	b.ResetTimer()
+	b.SetBytes(fileSize)
+
+	for i := 0; i < b.N; i++ {
+		if err := Create(context.Background(), outputPath, []string{inputPath}, opts); err != nil {
+			b.Fatal(err)
+		}
+		// Remove output files so next iteration starts fresh.
+		entries, _ := os.ReadDir(tmpDir)
+		for _, e := range entries {
+			if strings.Contains(e.Name(), ".par2") {
+				_ = os.Remove(filepath.Join(tmpDir, e.Name()))
+			}
+		}
+	}
+}
+
 func TestVolumeFileDoublingStrategy(t *testing.T) {
 	tmpDir := t.TempDir()
 
