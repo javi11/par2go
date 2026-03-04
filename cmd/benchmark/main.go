@@ -29,7 +29,7 @@ const (
 
 func main() {
 	inputFlag := flag.String("input", "/tmp/par2go_bench.bin", "input file (created with random data if absent)")
-	parparFlag := flag.String("parpar", "/Users/javi/Downloads/parpar-v0.4.5-macos-x64", "path to parpar binary")
+	parparFlag := flag.String("parpar", "", "path to parpar binary")
 	flag.Parse()
 
 	if err := ensureTestFile(*inputFlag, benchFileSizeBytes); err != nil {
