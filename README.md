@@ -99,6 +99,29 @@ err := par2go.Create(ctx, "/path/to/set.par2", inputFiles, opts)
 
 Use the main `.par2` with any PAR2 repair/verify tool; it will find the volume files by naming convention.
 
+## Performance
+
+Benchmarked on **Apple M4**, 1 GiB input file, 768 KB slice size, 10 recovery blocks:
+
+| Tool | Throughput |
+|---|---|
+| par2go | **~710 MB/s** |
+| parpar v0.4.5 (x64, Rosetta 2) | ~550 MB/s |
+
+par2go achieves ~125% of parpar's throughput on the same machine. parpar is an x64 binary running under Rosetta 2 emulation; par2go runs natively on arm64.
+
+The Go orchestration layer uses a single-pass pipeline:
+- **One read per file** — file data is read exactly once; hashing and encoding happen in the same pass.
+- **Parallel IFSC hash pool** — per-slice MD5/CRC32 computation runs on `numCPU/2` goroutines concurrently with disk I/O and GF16 compute.
+- **Parallel file scanning** — the initial 16 KB scan (needed for file IDs) runs concurrently across all input files.
+- **Parallel volume writes** — `.vol*.par2` files are written concurrently.
+
+Run the included benchmark CLI to compare on your own machine:
+
+```bash
+go run ./cmd/benchmark -input /path/to/largefile -parpar /path/to/parpar
+```
+
 ## Compatibility
 
 par2go only **creates** PAR2 files. To verify or repair, use an existing tool (e.g. par2cmdline or MultiPar) that reads the same [PAR2 format](https://github.com/Parchive/par2cmdline). The generated packets and volume layout follow the usual PAR2 conventions.
