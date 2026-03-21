@@ -37,6 +37,26 @@ type Options struct {
 	// NumGoroutines is the number of parallel GF compute threads (default: runtime.NumCPU()).
 	// Pass 0 to use hardware_concurrency() auto-detection.
 	NumGoroutines int
+	// MemoryLimit caps the memory used for recovery output buffers (in bytes).
+	// When NumRecovery * SliceSize exceeds this limit, encoding is split into
+	// multiple passes over the input files, each processing a subset of recovery
+	// blocks that fits within the budget. This dramatically improves cache locality
+	// for large recovery counts at the cost of re-reading input files.
+	// Default 0 means automatic (min of 75% physical RAM or 4 GiB).
+	MemoryLimit int64
+	// Method forces a specific GF16 SIMD method (0 = auto-detect).
+	// Use parpar.GF16Auto, parpar.GF16ShuffleAVX2, parpar.GF16ClmulNEON, etc.
+	Method int
+	// InputGrouping controls the input batch size for the GF16 encoder.
+	// 0 means auto-detect (typically ~12). Higher values use more memory
+	// but may improve throughput.
+	InputGrouping int
+	// ChunkLen controls the sub-slice chunk length for parallel GF16 processing.
+	// 0 means auto-detect based on the SIMD method's ideal chunk size.
+	ChunkLen int
+	// StagingAreas controls the number of double-buffered staging areas in the
+	// GF16 encoder. Default 0 means 2. More areas can overlap I/O and compute.
+	StagingAreas int
 	// OnProgress reports progress: phase is "hashing", "encoding", or "writing", pct is 0.0-1.0.
 	OnProgress func(phase string, pct float64)
 	// Creator is the creator string embedded in the PAR2 file (default: "Postie").
@@ -46,10 +66,15 @@ type Options struct {
 	Logger *slog.Logger
 }
 
+const defaultMemoryLimit = 4 * 1024 * 1024 * 1024 // 4 GiB
+
 func (o *Options) withDefaults() Options {
 	opts := *o
 	if opts.NumGoroutines <= 0 {
 		opts.NumGoroutines = runtime.NumCPU()
+	}
+	if opts.MemoryLimit <= 0 {
+		opts.MemoryLimit = defaultMemoryLimit
 	}
 	if opts.Creator == "" {
 		opts.Creator = "Postie"
@@ -58,6 +83,37 @@ func (o *Options) withDefaults() Options {
 		opts.Logger = discardHandler
 	}
 	return opts
+}
+
+// recoveryChunks splits recovery block exponents into chunks where each chunk's
+// output buffers fit within memoryLimit bytes. Returns a slice of exponent slices.
+func recoveryChunks(numRecovery, sliceSize int, memoryLimit int64) [][]uint16 {
+	blocksPerChunk := int(memoryLimit / int64(sliceSize))
+	if blocksPerChunk < 1 {
+		blocksPerChunk = 1
+	}
+	if blocksPerChunk >= numRecovery {
+		// Everything fits in one chunk — no re-reads needed.
+		exps := make([]uint16, numRecovery)
+		for i := range exps {
+			exps[i] = uint16(i)
+		}
+		return [][]uint16{exps}
+	}
+
+	var chunks [][]uint16
+	for offset := 0; offset < numRecovery; offset += blocksPerChunk {
+		end := offset + blocksPerChunk
+		if end > numRecovery {
+			end = numRecovery
+		}
+		chunk := make([]uint16, end-offset)
+		for i := range chunk {
+			chunk[i] = uint16(offset + i)
+		}
+		chunks = append(chunks, chunk)
+	}
+	return chunks
 }
 
 // recoveryBlock holds a single recovery block's exponent and data.
@@ -130,53 +186,90 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	mainBody := packets.MainPacket(uint64(opts.SliceSize), fileIDs)
 	recoverySetID := packets.RecoverySetID(mainBody)
 
-	// Phase 3: Single-pass hash+encode.
-	// Each file is read exactly once: hashFull and IFSC are computed while
-	// simultaneously feeding the RS encoder.  IFSC computation is offloaded
-	// to a pool of goroutines to overlap with I/O and GF16 compute.
+	// Phase 3: Chunked hash+encode.
+	// Recovery blocks are split into chunks that fit within MemoryLimit.
+	// The first chunk also computes hashFull and IFSC (single-pass).
+	// Subsequent chunks re-read the input files but skip hashing.
+	chunks := recoveryChunks(opts.NumRecovery, opts.SliceSize, opts.MemoryLimit)
+
 	opts.Logger.Debug("par2go: encoding recovery blocks",
 		"numRecovery", opts.NumRecovery,
-		"sliceSize", opts.SliceSize)
+		"sliceSize", opts.SliceSize,
+		"chunks", len(chunks),
+		"memoryLimit", opts.MemoryLimit)
 
-	proc, err := parpar.NewGfProc(opts.SliceSize, opts.NumGoroutines)
-	if err != nil {
-		return fmt.Errorf("par2go: init encoder: %w", err)
-	}
-	defer proc.Close()
+	recoveryBlocks := make([]recoveryBlock, 0, opts.NumRecovery)
 
-	opts.Logger.Debug("par2go: encoder ready", "method", proc.MethodName(), "threads", proc.NumThreads())
+	for ci, chunk := range chunks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
-	exponents := make([]uint16, opts.NumRecovery)
-	for i := range exponents {
-		exponents[i] = uint16(i)
-	}
-	proc.SetRecoverySlices(exponents)
+		proc, err := parpar.NewGfProcWithConfig(parpar.GfProcConfig{
+			SliceSize:     opts.SliceSize,
+			NumThreads:    opts.NumGoroutines,
+			Method:        opts.Method,
+			InputGrouping: opts.InputGrouping,
+			ChunkLen:      opts.ChunkLen,
+			StagingAreas:  opts.StagingAreas,
+		})
+		if err != nil {
+			return fmt.Errorf("par2go: init encoder (chunk %d): %w", ci, err)
+		}
 
-	if err := hashAndEncodeFiles(ctx, files, proc, opts.SliceSize, func(pct float64) {
-		report("hashing", pct)
-	}); err != nil {
-		return fmt.Errorf("par2go: hash+encode failed: %w", err)
+		if ci == 0 {
+			opts.Logger.Debug("par2go: encoder ready",
+				"method", proc.MethodName(),
+				"threads", proc.NumThreads(),
+				"chunkLen", proc.ChunkLen(),
+				"inputBatchSize", proc.InputBatchSize(),
+				"alignment", proc.Alignment(),
+				"stride", proc.Stride(),
+				"allocSliceSize", proc.AllocSliceSize(),
+				"stagingAreas", proc.StagingAreas())
+		}
+		opts.Logger.Debug("par2go: processing chunk", "chunk", ci+1, "of", len(chunks), "blocks", len(chunk))
+
+		proc.SetRecoverySlices(chunk)
+
+		// Progress: each chunk contributes proportionally to the total.
+		chunkBase := float64(ci) / float64(len(chunks))
+		chunkScale := 1.0 / float64(len(chunks))
+
+		if ci == 0 {
+			// First chunk: single-pass hash+encode (computes hashFull + IFSC).
+			if err := hashAndEncodeFiles(ctx, files, proc, opts.SliceSize, func(pct float64) {
+				report("hashing", chunkBase+pct*chunkScale)
+			}); err != nil {
+				proc.Close()
+				return fmt.Errorf("par2go: hash+encode failed: %w", err)
+			}
+		} else {
+			// Subsequent chunks: re-read files, encode only (no hashing).
+			if err := encodeFiles(ctx, files, proc, opts.SliceSize, func(pct float64) {
+				report("hashing", chunkBase+pct*chunkScale)
+			}); err != nil {
+				proc.Close()
+				return fmt.Errorf("par2go: encode chunk %d failed: %w", ci, err)
+			}
+		}
+
+		proc.End()
+
+		// Collect this chunk's recovery blocks.
+		for i, exp := range chunk {
+			rb := recoveryBlock{
+				exponent: exp,
+				data:     make([]byte, opts.SliceSize),
+			}
+			proc.GetOutput(i, rb.data)
+			recoveryBlocks = append(recoveryBlocks, rb)
+		}
+		proc.FreeMem()
+		proc.Close()
 	}
 
 	report("hashing", 1.0)
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	proc.End()
-
-	// Collect recovery blocks.
-	recoveryBlocks := make([]recoveryBlock, opts.NumRecovery)
-	for i := range recoveryBlocks {
-		recoveryBlocks[i] = recoveryBlock{
-			exponent: uint16(i),
-			data:     make([]byte, opts.SliceSize),
-		}
-		proc.GetOutput(i, recoveryBlocks[i].data)
-	}
-	proc.FreeMem()
-
 	report("encoding", 1.0)
 
 	// Phase 4: Write output files (volume files written in parallel).
@@ -445,6 +538,136 @@ func hashAndEncodeFiles(
 	readerWg.Wait()
 	close(hashCh)
 	hashWg.Wait()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	readerMu.Lock()
+	defer readerMu.Unlock()
+	if len(readerErrs) > 0 {
+		return readerErrs[0]
+	}
+	return nil
+}
+
+// encodeFiles re-reads all input files and feeds slices to the encoder.
+// Unlike hashAndEncodeFiles, it does NOT compute hashFull or IFSC —
+// those were already computed in the first chunk's pass.
+// This is used for subsequent chunks in memory-bounded chunked processing.
+func encodeFiles(
+	ctx context.Context,
+	files []fileInfo,
+	proc *parpar.GfProc,
+	sliceSize int,
+	onProgress func(float64),
+) error {
+	// Pre-assign global slice offsets per file.
+	offsets := make([]int, len(files))
+	totalSlices := 0
+	for i := range files {
+		offsets[i] = totalSlices
+		totalSlices += fileNumSlices(files[i].size, sliceSize)
+	}
+	if totalSlices == 0 {
+		return nil
+	}
+
+	// Open all files.
+	openFiles := make([]*os.File, len(files))
+	for i := range files {
+		f, err := os.Open(files[i].path)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = openFiles[j].Close()
+			}
+			return fmt.Errorf("par2go: open %s: %w", files[i].path, err)
+		}
+		openFiles[i] = f
+	}
+	defer func() {
+		for _, f := range openFiles {
+			_ = f.Close()
+		}
+	}()
+
+	// Buffer pool: reuses slice-sized buffers across all goroutines.
+	bufPool := &sync.Pool{
+		New: func() any {
+			b := make([]byte, sliceSize)
+			return &b
+		},
+	}
+
+	// Reader goroutines: read slices, call proc.Add inline (no hashing).
+	numReaders := len(files)
+	if numReaders > runtime.NumCPU() {
+		numReaders = runtime.NumCPU()
+	}
+	if numReaders < 1 {
+		numReaders = 1
+	}
+	sem := make(chan struct{}, numReaders)
+
+	var readerErrs []error
+	var readerMu sync.Mutex
+	var readerWg sync.WaitGroup
+	var doneSlices atomic.Int64
+
+	for i := range files {
+		readerWg.Add(1)
+		go func(i int) {
+			defer readerWg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			fi := &files[i]
+			f := openFiles[i]
+			sliceIdx := 0
+
+			for {
+				if err := ctx.Err(); err != nil {
+					readerMu.Lock()
+					readerErrs = append(readerErrs, err)
+					readerMu.Unlock()
+					return
+				}
+
+				bptr := bufPool.Get().(*[]byte)
+				buf := *bptr
+
+				n, err := io.ReadFull(f, buf)
+				if n == 0 {
+					bufPool.Put(bptr)
+					if err == io.EOF {
+						break
+					}
+					readerMu.Lock()
+					readerErrs = append(readerErrs, fmt.Errorf("read %s: %w", fi.path, err))
+					readerMu.Unlock()
+					return
+				}
+
+				// Zero-pad last partial slice for encoding.
+				if n < sliceSize {
+					clear(buf[n:])
+				}
+
+				proc.Add(offsets[i]+sliceIdx, buf)
+				bufPool.Put(bptr)
+
+				sliceIdx++
+				done := doneSlices.Add(1)
+				onProgress(float64(done) / float64(totalSlices))
+
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					break
+				}
+			}
+		}(i)
+	}
+
+	readerWg.Wait()
 
 	if err := ctx.Err(); err != nil {
 		return err

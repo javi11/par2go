@@ -111,6 +111,75 @@ func TestGfProcDeterministic(t *testing.T) {
 	}
 }
 
+func TestGfProcQueryMethods(t *testing.T) {
+	proc, err := NewGfProc(1024, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proc.Close()
+
+	if cl := proc.ChunkLen(); cl <= 0 {
+		t.Errorf("ChunkLen() = %d, want > 0", cl)
+	}
+	if bs := proc.InputBatchSize(); bs <= 0 {
+		t.Errorf("InputBatchSize() = %d, want > 0", bs)
+	}
+	if al := proc.Alignment(); al <= 0 {
+		t.Errorf("Alignment() = %d, want > 0", al)
+	}
+	if st := proc.Stride(); st <= 0 {
+		t.Errorf("Stride() = %d, want > 0", st)
+	}
+	if as := proc.AllocSliceSize(); as < 1024 {
+		t.Errorf("AllocSliceSize() = %d, want >= 1024", as)
+	}
+	if sa := proc.StagingAreas(); sa != 2 {
+		t.Errorf("StagingAreas() = %d, want 2 (default)", sa)
+	}
+
+	t.Logf("ChunkLen=%d InputBatchSize=%d Alignment=%d Stride=%d AllocSliceSize=%d StagingAreas=%d",
+		proc.ChunkLen(), proc.InputBatchSize(), proc.Alignment(), proc.Stride(), proc.AllocSliceSize(), proc.StagingAreas())
+}
+
+func TestGfProcWithConfig(t *testing.T) {
+	// Test with custom staging areas.
+	proc, err := NewGfProcWithConfig(GfProcConfig{
+		SliceSize:    1024,
+		StagingAreas: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proc.Close()
+
+	if sa := proc.StagingAreas(); sa != 4 {
+		t.Errorf("StagingAreas() = %d, want 4", sa)
+	}
+
+	// Verify encoding still works.
+	proc.SetRecoverySlices([]uint16{0, 1})
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	proc.Add(0, data)
+	proc.End()
+
+	out := make([]byte, 1024)
+	proc.GetOutput(0, out)
+
+	allZero := true
+	for _, b := range out {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		t.Error("recovery block is all zeros with custom config")
+	}
+}
+
 func BenchmarkGfProcEncode(b *testing.B) {
 	sliceSize := 768 * 1024 // 768KB — typical PAR2 slice
 	numInputs := 20
