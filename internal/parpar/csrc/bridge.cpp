@@ -25,13 +25,16 @@ struct parpar_gfproc {
 
 extern "C" {
 
-parpar_gfproc_t* parpar_gfproc_new(size_t sliceSize, int numThreads) {
+parpar_gfproc_t* parpar_gfproc_new(size_t sliceSize, int numThreads,
+                                    int method, unsigned inputGrouping,
+                                    size_t chunkLen, unsigned stagingAreas) {
     ensure_gfmat_init();
 
     parpar_gfproc_t* proc = new(std::nothrow) parpar_gfproc_t;
     if (!proc) return nullptr;
 
-    proc->cpu = new(std::nothrow) PAR2ProcCPU(2); // 2 staging areas
+    int sa = stagingAreas > 0 ? (int)stagingAreas : 2;
+    proc->cpu = new(std::nothrow) PAR2ProcCPU(sa);
     if (!proc->cpu) {
         delete proc;
         return nullptr;
@@ -50,7 +53,8 @@ parpar_gfproc_t* parpar_gfproc_new(size_t sliceSize, int numThreads) {
 
     // init() creates the GF16 multiplier, allocates staging buffers, starts
     // the transfer thread, and launches compute worker threads.
-    if (!proc->cpu->init(GF16_AUTO, 0, 0)) {
+    Galois16Methods gfMethod = (method > 0) ? (Galois16Methods)method : GF16_AUTO;
+    if (!proc->cpu->init(gfMethod, inputGrouping, chunkLen)) {
         delete proc->cpu;
         delete proc;
         return nullptr;
@@ -125,6 +129,36 @@ const char* parpar_gfproc_method_name(parpar_gfproc_t* proc) {
 unsigned parpar_gfproc_num_threads(parpar_gfproc_t* proc) {
     if (!proc || !proc->cpu) return 0;
     return (unsigned)proc->cpu->getNumThreads();
+}
+
+size_t parpar_gfproc_chunk_len(parpar_gfproc_t* proc) {
+    if (!proc || !proc->cpu) return 0;
+    return proc->cpu->getChunkLen();
+}
+
+unsigned parpar_gfproc_input_batch_size(parpar_gfproc_t* proc) {
+    if (!proc || !proc->cpu) return 0;
+    return proc->cpu->getInputBatchSize();
+}
+
+unsigned parpar_gfproc_alignment(parpar_gfproc_t* proc) {
+    if (!proc || !proc->cpu) return 0;
+    return proc->cpu->getAlignment();
+}
+
+unsigned parpar_gfproc_stride(parpar_gfproc_t* proc) {
+    if (!proc || !proc->cpu) return 0;
+    return proc->cpu->getStride();
+}
+
+size_t parpar_gfproc_alloc_slice_size(parpar_gfproc_t* proc) {
+    if (!proc || !proc->cpu) return 0;
+    return proc->cpu->getAllocSliceSize();
+}
+
+unsigned parpar_gfproc_staging_areas(parpar_gfproc_t* proc) {
+    if (!proc || !proc->cpu) return 0;
+    return proc->cpu->getStagingAreas();
 }
 
 } // extern "C"
