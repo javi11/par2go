@@ -21,10 +21,51 @@ typedef struct parpar_gfproc parpar_gfproc_t;
 #define PARPAR_ADD_FULL     2
 #define PARPAR_ADD_ALL_FULL 3
 
+// GF16 method constants (match Galois16Methods enum).
+#define PARPAR_GF16_AUTO                 0
+#define PARPAR_GF16_LOOKUP               1
+#define PARPAR_GF16_LOOKUP_SSE2          2
+#define PARPAR_GF16_LOOKUP3              3
+#define PARPAR_GF16_SHUFFLE_NEON         4
+#define PARPAR_GF16_SHUFFLE_128_SVE      5
+#define PARPAR_GF16_SHUFFLE_128_SVE2     6
+#define PARPAR_GF16_SHUFFLE2X_128_SVE2   7
+#define PARPAR_GF16_SHUFFLE_512_SVE2     8
+#define PARPAR_GF16_SHUFFLE_128_RVV      9
+#define PARPAR_GF16_SHUFFLE_SSSE3        10
+#define PARPAR_GF16_SHUFFLE_AVX          11
+#define PARPAR_GF16_SHUFFLE_AVX2         12
+#define PARPAR_GF16_SHUFFLE_AVX512       13
+#define PARPAR_GF16_SHUFFLE_VBMI         14
+#define PARPAR_GF16_SHUFFLE2X_AVX2       15
+#define PARPAR_GF16_SHUFFLE2X_AVX512     16
+#define PARPAR_GF16_XOR_SSE2             17
+#define PARPAR_GF16_XOR_JIT_SSE2         18
+#define PARPAR_GF16_XOR_JIT_AVX2         19
+#define PARPAR_GF16_XOR_JIT_AVX512       20
+#define PARPAR_GF16_AFFINE_GFNI          21
+#define PARPAR_GF16_AFFINE_AVX2          22
+#define PARPAR_GF16_AFFINE_AVX10         23
+#define PARPAR_GF16_AFFINE_AVX512        24
+#define PARPAR_GF16_AFFINE2X_GFNI        25
+#define PARPAR_GF16_AFFINE2X_AVX2        26
+#define PARPAR_GF16_AFFINE2X_AVX10       27
+#define PARPAR_GF16_AFFINE2X_AVX512      28
+#define PARPAR_GF16_CLMUL_NEON           29
+#define PARPAR_GF16_CLMUL_SHA3           30
+#define PARPAR_GF16_CLMUL_SVE2           31
+#define PARPAR_GF16_CLMUL_RVV            32
+
 // Create a new PAR2ProcCPU processor for the given slice size.
-// numThreads <= 0 selects hardware_concurrency().
+//   numThreads   <= 0: use hardware_concurrency()
+//   method:       PARPAR_GF16_* constant (0 = auto-detect)
+//   inputGrouping: input batch size (0 = auto, typically ~12)
+//   chunkLen:      sub-slice chunk length (0 = auto, method's idealChunkSize)
+//   stagingAreas:  number of double-buffered staging areas (0 = default 2)
 // Returns NULL on allocation or initialization failure.
-parpar_gfproc_t* parpar_gfproc_new(size_t sliceSize, int numThreads);
+parpar_gfproc_t* parpar_gfproc_new(size_t sliceSize, int numThreads,
+                                    int method, unsigned inputGrouping,
+                                    size_t chunkLen, unsigned stagingAreas);
 
 // Free a processor and release all C++ resources.
 void parpar_gfproc_free(parpar_gfproc_t* proc);
@@ -59,6 +100,24 @@ const char* parpar_gfproc_method_name(parpar_gfproc_t* proc);
 
 // Return the number of active compute threads.
 unsigned parpar_gfproc_num_threads(parpar_gfproc_t* proc);
+
+// Query the actual chunk length after auto-calculation.
+size_t parpar_gfproc_chunk_len(parpar_gfproc_t* proc);
+
+// Query the actual input batch size.
+unsigned parpar_gfproc_input_batch_size(parpar_gfproc_t* proc);
+
+// Query the buffer alignment requirement.
+unsigned parpar_gfproc_alignment(parpar_gfproc_t* proc);
+
+// Query the SIMD stride multiplier.
+unsigned parpar_gfproc_stride(parpar_gfproc_t* proc);
+
+// Query the padded slice size including alignment.
+size_t parpar_gfproc_alloc_slice_size(parpar_gfproc_t* proc);
+
+// Query the number of staging areas.
+unsigned parpar_gfproc_staging_areas(parpar_gfproc_t* proc);
 
 #ifdef __cplusplus
 }

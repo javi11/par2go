@@ -295,6 +295,138 @@ func TestCreateNoInputFiles(t *testing.T) {
 	}
 }
 
+// TestChunkedEncodingMatchesSinglePass verifies that memory-bounded chunked
+// processing produces bit-identical recovery data to a single-pass run.
+func TestChunkedEncodingMatchesSinglePass(t *testing.T) {
+	tmpDir := t.TempDir()
+	inputPath := filepath.Join(tmpDir, "testfile.bin")
+
+	// 1 MB file with deterministic data.
+	data := make([]byte, 1024*1024)
+	for i := range data {
+		data[i] = byte(i*7 + 13)
+	}
+	if err := os.WriteFile(inputPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	const sliceSize = 10000
+	const numRecovery = 10
+
+	// Run 1: single-pass (MemoryLimit large enough to fit all recovery blocks).
+	singleDir := filepath.Join(tmpDir, "single")
+	if err := os.MkdirAll(singleDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	singleOut := filepath.Join(singleDir, "testfile.bin.par2")
+	err := Create(context.Background(), singleOut, []string{inputPath}, Options{
+		SliceSize:   sliceSize,
+		NumRecovery: numRecovery,
+		MemoryLimit: 1024 * 1024 * 1024, // 1 GiB — everything fits in one chunk
+	})
+	if err != nil {
+		t.Fatalf("single-pass: %v", err)
+	}
+
+	// Run 2: chunked (MemoryLimit forces multiple chunks).
+	// With sliceSize=10000 and memoryLimit=30000, we get ~3 blocks per chunk
+	// so 10 recovery blocks → 4 chunks.
+	chunkedDir := filepath.Join(tmpDir, "chunked")
+	if err := os.MkdirAll(chunkedDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	chunkedOut := filepath.Join(chunkedDir, "testfile.bin.par2")
+	err = Create(context.Background(), chunkedOut, []string{inputPath}, Options{
+		SliceSize:   sliceSize,
+		NumRecovery: numRecovery,
+		MemoryLimit: 30000, // Force 4 chunks of ~3 blocks each
+	})
+	if err != nil {
+		t.Fatalf("chunked: %v", err)
+	}
+
+	// Compare all output files.
+	singleFiles := readPar2Files(t, singleDir)
+	chunkedFiles := readPar2Files(t, chunkedDir)
+
+	if len(singleFiles) != len(chunkedFiles) {
+		t.Fatalf("file count mismatch: single=%d chunked=%d", len(singleFiles), len(chunkedFiles))
+	}
+
+	for name, singleData := range singleFiles {
+		chunkedData, ok := chunkedFiles[name]
+		if !ok {
+			t.Errorf("chunked missing file %s", name)
+			continue
+		}
+		if !bytes.Equal(singleData, chunkedData) {
+			t.Errorf("file %s differs: single=%d bytes, chunked=%d bytes", name, len(singleData), len(chunkedData))
+		}
+	}
+}
+
+// readPar2Files reads all .par2 files in dir and returns a map of basename → content.
+func readPar2Files(t *testing.T, dir string) map[string][]byte {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(map[string][]byte)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".par2") {
+			data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			result[e.Name()] = data
+		}
+	}
+	return result
+}
+
+// TestRecoveryChunks verifies the chunk splitting logic.
+func TestRecoveryChunks(t *testing.T) {
+	tests := []struct {
+		name        string
+		numRecovery int
+		sliceSize   int
+		memoryLimit int64
+		wantChunks  int
+	}{
+		{"all fit", 10, 1000, 100000, 1},
+		{"exact fit", 10, 1000, 10000, 1},
+		{"two chunks", 10, 1000, 5000, 2},
+		{"four chunks", 10, 1000, 3000, 4},
+		{"one per chunk", 10, 1000, 1000, 10},
+		{"tiny limit", 10, 1000, 500, 10},
+		{"single recovery", 1, 1000, 500, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chunks := recoveryChunks(tt.numRecovery, tt.sliceSize, tt.memoryLimit)
+			if len(chunks) != tt.wantChunks {
+				t.Errorf("got %d chunks, want %d", len(chunks), tt.wantChunks)
+			}
+
+			// Verify all exponents are present exactly once.
+			seen := make(map[uint16]bool)
+			for _, chunk := range chunks {
+				for _, exp := range chunk {
+					if seen[exp] {
+						t.Errorf("duplicate exponent %d", exp)
+					}
+					seen[exp] = true
+				}
+			}
+			if len(seen) != tt.numRecovery {
+				t.Errorf("got %d unique exponents, want %d", len(seen), tt.numRecovery)
+			}
+		})
+	}
+}
+
 func BenchmarkCreate1MB(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		tmpDir := b.TempDir()
