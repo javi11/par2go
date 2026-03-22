@@ -11,6 +11,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -22,10 +23,19 @@ import (
 )
 
 const (
-	benchFileSizeBytes = 1024 * 1024 * 1024 // 1 GiB
-	benchSliceSize     = 768 * 1024          // 768 KB (matches parpar default benchmark)
-	benchNumRecovery   = 10
+	benchFileSizeBytes = 1024 * 1024 * 1024  // 1 GiB
+	benchSliceSize     = 10 * 1024 * 1024    // 10 MB
+	benchMemoryLimit   = 4096 * 1024 * 1024  // 4096 MB
+	benchRecoveryPct   = 0.20                // 20%
+	benchRecoveryExtra = 2                   // +2 extra slices
 )
+
+// calcNumRecovery computes the number of recovery slices equivalent to
+// parpar's -r20%+2 flag: ceil(fileSize/sliceSize) * pct + extra.
+func calcNumRecovery(fileSize int64, sliceSize int) int {
+	inputSlices := int(math.Ceil(float64(fileSize) / float64(sliceSize)))
+	return int(math.Ceil(float64(inputSlices)*benchRecoveryPct)) + benchRecoveryExtra
+}
 
 func main() {
 	inputFlag := flag.String("input", "/tmp/par2go_bench.bin", "input file (created with random data if absent)")
@@ -37,8 +47,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	numRecovery := calcNumRecovery(benchFileSizeBytes, benchSliceSize)
+	fmt.Printf("\nSettings: slice=10M, recovery=20%%+2 (%d slices), memory=4096M\n", numRecovery)
+
 	fmt.Println()
-	par2goMBs := runPar2go(*inputFlag)
+	par2goMBs := runPar2go(*inputFlag, numRecovery)
 	fmt.Println()
 	parparMBs := runParpar(*parparFlag, *inputFlag)
 
@@ -88,7 +101,7 @@ func ensureTestFile(path string, size int64) error {
 }
 
 // runPar2go benchmarks par2go and returns MB/s throughput.
-func runPar2go(inputPath string) float64 {
+func runPar2go(inputPath string, numRecovery int) float64 {
 	const outputPath = "/tmp/bench_par2go.par2"
 	cleanupPar2(outputPath)
 	defer cleanupPar2(outputPath)
@@ -102,11 +115,12 @@ func runPar2go(inputPath string) float64 {
 
 	opts := par2go.Options{
 		SliceSize:   benchSliceSize,
-		NumRecovery: benchNumRecovery,
+		NumRecovery: numRecovery,
+		MemoryLimit: benchMemoryLimit,
 	}
 
-	fmt.Printf("par2go: starting (%.0f MB, slice=%dKB, recovery=%d)...\n",
-		fileMB, benchSliceSize/1024, benchNumRecovery)
+	fmt.Printf("par2go: starting (%.0f MB, slice=%dM, recovery=%d, mem=%dM)...\n",
+		fileMB, benchSliceSize/(1024*1024), numRecovery, benchMemoryLimit/(1024*1024))
 
 	start := time.Now()
 	if err := par2go.Create(context.Background(), outputPath, []string{inputPath}, opts); err != nil {
@@ -139,14 +153,15 @@ func runParpar(binPath, inputPath string) float64 {
 	fileMB := float64(info.Size()) / (1024 * 1024)
 
 	args := []string{
-		"-s", fmt.Sprintf("%dk", benchSliceSize/1024),
-		"-r", fmt.Sprintf("%d", benchNumRecovery),
+		"-s", fmt.Sprintf("%dM", benchSliceSize/(1024*1024)),
+		"-r", fmt.Sprintf("%.0f%%+%d", benchRecoveryPct*100, benchRecoveryExtra),
+		"-m", fmt.Sprintf("%dM", benchMemoryLimit/(1024*1024)),
 		"-o", outputPath,
 		"--", inputPath,
 	}
 
-	fmt.Printf("parpar: starting (%.0f MB, slice=%dKB, recovery=%d)...\n",
-		fileMB, benchSliceSize/1024, benchNumRecovery)
+	fmt.Printf("parpar: starting (%.0f MB, slice=%dM, recovery=%.0f%%+%d, mem=%dM)...\n",
+		fileMB, benchSliceSize/(1024*1024), benchRecoveryPct*100, benchRecoveryExtra, benchMemoryLimit/(1024*1024))
 
 	start := time.Now()
 	cmd := exec.Command(binPath, args...)
