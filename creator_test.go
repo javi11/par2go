@@ -87,6 +87,7 @@ func testGenerateConstants(n int) []uint16 {
 }
 
 func TestCreateBasic(t *testing.T) {
+	skipIfCPUMismatch(t)
 	// Create a temp directory
 	tmpDir := t.TempDir()
 
@@ -157,6 +158,7 @@ func TestCreateBasic(t *testing.T) {
 }
 
 func TestCreateMultipleFiles(t *testing.T) {
+	skipIfCPUMismatch(t)
 	tmpDir := t.TempDir()
 
 	// Create two input files
@@ -193,6 +195,7 @@ func TestCreateMultipleFiles(t *testing.T) {
 }
 
 func TestCreateProgress(t *testing.T) {
+	skipIfCPUMismatch(t)
 	tmpDir := t.TempDir()
 
 	inputPath := filepath.Join(tmpDir, "testfile.bin")
@@ -236,6 +239,7 @@ func TestCreateProgress(t *testing.T) {
 }
 
 func TestCreateCancel(t *testing.T) {
+	skipIfCPUMismatch(t)
 	tmpDir := t.TempDir()
 
 	inputPath := filepath.Join(tmpDir, "testfile.bin")
@@ -298,6 +302,7 @@ func TestCreateNoInputFiles(t *testing.T) {
 // TestChunkedEncodingMatchesSinglePass verifies that memory-bounded chunked
 // processing produces bit-identical recovery data to a single-pass run.
 func TestChunkedEncodingMatchesSinglePass(t *testing.T) {
+	skipIfCPUMismatch(t)
 	tmpDir := t.TempDir()
 	inputPath := filepath.Join(tmpDir, "testfile.bin")
 
@@ -486,6 +491,7 @@ func BenchmarkCreate100MB(b *testing.B) {
 }
 
 func TestVolumeFileDoublingStrategy(t *testing.T) {
+	skipIfCPUMismatch(t)
 	tmpDir := t.TempDir()
 
 	// Create a file large enough to produce many recovery blocks
@@ -599,6 +605,7 @@ func readPAR2Packets(t *testing.T, path string) []parsedPacket {
 // --- Integration tests ---
 
 func TestCreateAndValidatePackets(t *testing.T) {
+	skipIfCPUMismatch(t)
 	tmpDir := t.TempDir()
 	sliceSize := 1000
 
@@ -831,6 +838,7 @@ func TestCreateAndValidatePackets(t *testing.T) {
 }
 
 func TestCreateAndRecoverCorruptedSlice(t *testing.T) {
+	skipIfCPUMismatch(t)
 	tmpDir := t.TempDir()
 
 	sliceSize := 100 // multiple of 4, even (required for GF16)
