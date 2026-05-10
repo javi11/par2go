@@ -141,11 +141,44 @@ func fileNumSlices(size uint64, sliceSize int) int {
 	return int((size + uint64(sliceSize) - 1) / uint64(sliceSize))
 }
 
+// InputFile pairs an on-disk path with the logical filename to embed
+// in the PAR2 FileDesc packet.
+//
+// Name should use forward-slash separators for relative paths (e.g.
+// "folder2/file.txt"). When Name is empty, filepath.Base(Path) is used,
+// matching the behavior of Create.
+//
+// Embedding relative paths makes downloaders such as SABnzbd and NZBGet
+// reconstruct the original folder tree on disk after par2 verification
+// (they use the FileDesc filename to rename downloaded flat files into
+// subdirectories). This matches the default behavior of ParPar.
+//
+// Name is rejected if it contains a backslash, is absolute, or contains
+// a ".." segment, to prevent path-traversal in downstream consumers.
+type InputFile struct {
+	Path string
+	Name string
+}
+
 // Create creates PAR2 parity files for the given input files.
 //
 // outputPath is the path for the main .par2 file (e.g., "/path/to/file.par2").
 // Volume files will be created alongside with names like file.vol00+01.par2.
+//
+// FileDesc filenames are set to filepath.Base of each input path. Use
+// CreateWithNames to embed relative paths instead.
 func Create(ctx context.Context, outputPath string, inputFiles []string, opts Options) error {
+	inputs := make([]InputFile, len(inputFiles))
+	for i, p := range inputFiles {
+		inputs[i] = InputFile{Path: p}
+	}
+	return CreateWithNames(ctx, outputPath, inputs, opts)
+}
+
+// CreateWithNames is like Create but allows callers to specify the logical
+// filename (including a relative path) for each input file. All inputs are
+// bundled into a single par2 set written to outputPath.
+func CreateWithNames(ctx context.Context, outputPath string, inputs []InputFile, opts Options) error {
 	opts = opts.withDefaults()
 
 	if opts.SliceSize <= 0 || opts.SliceSize%4 != 0 {
@@ -154,8 +187,16 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	if opts.NumRecovery <= 0 {
 		return fmt.Errorf("par2go: NumRecovery must be positive, got %d", opts.NumRecovery)
 	}
-	if len(inputFiles) == 0 {
+	if len(inputs) == 0 {
 		return fmt.Errorf("par2go: no input files")
+	}
+	for i, in := range inputs {
+		if in.Path == "" {
+			return fmt.Errorf("par2go: input %d has empty path", i)
+		}
+		if err := validateInputName(in.Name); err != nil {
+			return fmt.Errorf("par2go: input %d (%s): %w", i, in.Path, err)
+		}
 	}
 
 	report := func(phase string, pct float64) {
@@ -166,10 +207,10 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 
 	// Phase 1: Quick scan — stat + read first 16KB per file in parallel.
 	// Provides hash16k, size, and fileID needed for the Main packet.
-	opts.Logger.Debug("par2go: scanning input files", "count", len(inputFiles))
+	opts.Logger.Debug("par2go: scanning input files", "count", len(inputs))
 	report("hashing", 0)
 
-	files, err := quickScanFiles(ctx, inputFiles)
+	files, err := quickScanFiles(ctx, inputs)
 	if err != nil {
 		return fmt.Errorf("par2go: scanning failed: %w", err)
 	}
@@ -288,8 +329,30 @@ func Create(ctx context.Context, outputPath string, inputFiles []string, opts Op
 	return nil
 }
 
+// validateInputName rejects names that could cause path-traversal or that
+// downstream PAR2 consumers may reject. Empty names are allowed (they fall
+// back to the basename of Path at scan time).
+func validateInputName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if strings.Contains(name, "\\") {
+		return fmt.Errorf("name %q must not contain backslash", name)
+	}
+	if strings.HasPrefix(name, "/") {
+		return fmt.Errorf("name %q must be relative, not absolute", name)
+	}
+	for _, seg := range strings.Split(name, "/") {
+		if seg == ".." {
+			return fmt.Errorf("name %q must not contain '..' segment", name)
+		}
+	}
+	return nil
+}
+
 // quickScanFile reads file metadata and the first 16KB to compute hash16k and fileID.
-func quickScanFile(path string) (fileInfo, error) {
+// If name is empty, filepath.Base(path) is used.
+func quickScanFile(path, name string) (fileInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return fileInfo{}, fmt.Errorf("open %s: %w", path, err)
@@ -301,9 +364,13 @@ func quickScanFile(path string) (fileInfo, error) {
 		return fileInfo{}, fmt.Errorf("stat %s: %w", path, err)
 	}
 
+	if name == "" {
+		name = filepath.Base(path)
+	}
+
 	fi := fileInfo{
 		path: path,
-		name: filepath.Base(path),
+		name: name,
 		size: uint64(stat.Size()),
 	}
 
@@ -323,26 +390,26 @@ func quickScanFile(path string) (fileInfo, error) {
 	return fi, nil
 }
 
-// quickScanFiles runs quickScanFile on all paths concurrently.
-func quickScanFiles(ctx context.Context, paths []string) ([]fileInfo, error) {
-	files := make([]fileInfo, len(paths))
-	errc := make(chan error, len(paths))
+// quickScanFiles runs quickScanFile on all inputs concurrently.
+func quickScanFiles(ctx context.Context, inputs []InputFile) ([]fileInfo, error) {
+	files := make([]fileInfo, len(inputs))
+	errc := make(chan error, len(inputs))
 
 	var wg sync.WaitGroup
-	for i, p := range paths {
+	for i, in := range inputs {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		wg.Add(1)
-		go func(i int, p string) {
+		go func(i int, in InputFile) {
 			defer wg.Done()
-			fi, err := quickScanFile(p)
+			fi, err := quickScanFile(in.Path, in.Name)
 			if err != nil {
 				errc <- err
 				return
 			}
 			files[i] = fi
-		}(i, p)
+		}(i, in)
 	}
 	wg.Wait()
 	close(errc)
