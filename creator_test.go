@@ -5,10 +5,13 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/javi11/par2go/internal/packets"
 )
@@ -257,6 +260,96 @@ func TestCreateCancel(t *testing.T) {
 	err := Create(ctx, outputPath, []string{inputPath}, opts)
 	if err == nil {
 		t.Error("expected error from cancelled context")
+	}
+}
+
+// TestCreateCancelMidEncode verifies that cancelling the context while the
+// SIMD compute workers are mid-flight does NOT abort the process via the
+// stride assertion in gf16mul.h (mul_add_multi_packpf). The fix is in the
+// chunk-loop teardown — proc.End() must drain compute threads before
+// proc.Close() frees their staging buffers.
+//
+// Against the pre-fix code this test would terminate the test binary itself
+// with `Assertion failed: (isMultipleOfStride(len)) ...`, so passing it is
+// proof the regression is fixed.
+func TestCreateCancelMidEncode(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Make the file large enough that the encoding phase takes long enough
+	// to observe at least one OnProgress("encoding") callback before cancel.
+	// 8 MB at 64 KB slice size = 128 input slices.
+	const fileSize = 8 << 20
+	const sliceSize = 64 << 10
+
+	inputPath := filepath.Join(tmpDir, "testfile.bin")
+	data := make([]byte, fileSize)
+	for i := range data {
+		data[i] = byte(i * 31)
+	}
+	if err := os.WriteFile(inputPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	outputPath := filepath.Join(tmpDir, "testfile.bin.par2")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var (
+		mu             sync.Mutex
+		sawEncoding    bool
+		cancelTriggered = make(chan struct{}, 1)
+	)
+
+	opts := Options{
+		SliceSize:   sliceSize,
+		NumRecovery: 64, // enough recovery blocks to make encoding non-trivial
+		OnProgress: func(phase string, pct float64) {
+			// Cancel as soon as we see ANY encoding progress callback —
+			// that means the C compute workers are actively churning.
+			if phase == "encoding" || phase == "hashing" {
+				mu.Lock()
+				if !sawEncoding && pct > 0.0 {
+					sawEncoding = true
+					mu.Unlock()
+					select {
+					case cancelTriggered <- struct{}{}:
+					default:
+					}
+					return
+				}
+				mu.Unlock()
+			}
+		},
+	}
+
+	// Run Create in a goroutine; cancel as soon as the OnProgress callback
+	// fires for the first time (workers are active).
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Create(ctx, outputPath, []string{inputPath}, opts)
+	}()
+
+	// Wait for the first progress signal, then cancel.
+	select {
+	case <-cancelTriggered:
+		cancel()
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Fatal("never saw an encoding/hashing OnProgress callback within 10s")
+	}
+
+	// Create must return (no hang, no abort).
+	select {
+	case err := <-errCh:
+		// On cancellation we expect context.Canceled wrapped in some error
+		// from par2go, or a successful completion if the race was won. Both
+		// are acceptable — the critical assertion is that the process did
+		// NOT abort with a C stride assertion (test binary still running).
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Logf("Create returned: %v (non-canceled error is acceptable - this test mainly guards against process abort)", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Create did not return within 30s after cancellation - likely deadlocked draining compute workers")
 	}
 }
 

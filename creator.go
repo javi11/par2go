@@ -246,68 +246,86 @@ func CreateWithNames(ctx context.Context, outputPath string, inputs []InputFile,
 			return err
 		}
 
-		proc, err := parpar.NewGfProcWithConfig(parpar.GfProcConfig{
-			SliceSize:     opts.SliceSize,
-			NumThreads:    opts.NumGoroutines,
-			Method:        opts.Method,
-			InputGrouping: opts.InputGrouping,
-			ChunkLen:      opts.ChunkLen,
-			StagingAreas:  opts.StagingAreas,
-		})
-		if err != nil {
-			return fmt.Errorf("par2go: init encoder (chunk %d): %w", ci, err)
-		}
+		if err := func() error {
+			proc, err := parpar.NewGfProcWithConfig(parpar.GfProcConfig{
+				SliceSize:     opts.SliceSize,
+				NumThreads:    opts.NumGoroutines,
+				Method:        opts.Method,
+				InputGrouping: opts.InputGrouping,
+				ChunkLen:      opts.ChunkLen,
+				StagingAreas:  opts.StagingAreas,
+			})
+			if err != nil {
+				return fmt.Errorf("par2go: init encoder (chunk %d): %w", ci, err)
+			}
 
-		if ci == 0 {
-			opts.Logger.Debug("par2go: encoder ready",
-				"method", proc.MethodName(),
-				"threads", proc.NumThreads(),
-				"chunkLen", proc.ChunkLen(),
-				"inputBatchSize", proc.InputBatchSize(),
-				"alignment", proc.Alignment(),
-				"stride", proc.Stride(),
-				"allocSliceSize", proc.AllocSliceSize(),
-				"stagingAreas", proc.StagingAreas())
-		}
-		opts.Logger.Debug("par2go: processing chunk", "chunk", ci+1, "of", len(chunks), "blocks", len(chunk))
-
-		proc.SetRecoverySlices(chunk)
-
-		// Progress: each chunk contributes proportionally to the total.
-		chunkBase := float64(ci) / float64(len(chunks))
-		chunkScale := 1.0 / float64(len(chunks))
-
-		if ci == 0 {
-			// First chunk: single-pass hash+encode (computes hashFull + IFSC).
-			if err := hashAndEncodeFiles(ctx, files, proc, opts.SliceSize, func(pct float64) {
-				report("hashing", chunkBase+pct*chunkScale)
-			}); err != nil {
+			// PAR2ProcCPU spawns asynchronous SIMD compute workers in C. They
+			// must be drained via proc.End() before proc.Close() frees the
+			// staging buffers, otherwise an in-flight worker hits the stride
+			// assertion in gf16mul.h:mul_add_multi_packpf and abort()s the
+			// process. This defer guarantees the drain-before-close order on
+			// every exit path — including ctx cancellation, where the encode
+			// step returns early while compute is still active.
+			ended := false
+			defer func() {
+				if !ended {
+					proc.End()
+				}
 				proc.Close()
-				return fmt.Errorf("par2go: hash+encode failed: %w", err)
-			}
-		} else {
-			// Subsequent chunks: re-read files, encode only (no hashing).
-			if err := encodeFiles(ctx, files, proc, opts.SliceSize, func(pct float64) {
-				report("hashing", chunkBase+pct*chunkScale)
-			}); err != nil {
-				proc.Close()
-				return fmt.Errorf("par2go: encode chunk %d failed: %w", ci, err)
-			}
-		}
+			}()
 
-		proc.End()
-
-		// Collect this chunk's recovery blocks.
-		for i, exp := range chunk {
-			rb := recoveryBlock{
-				exponent: exp,
-				data:     make([]byte, opts.SliceSize),
+			if ci == 0 {
+				opts.Logger.Debug("par2go: encoder ready",
+					"method", proc.MethodName(),
+					"threads", proc.NumThreads(),
+					"chunkLen", proc.ChunkLen(),
+					"inputBatchSize", proc.InputBatchSize(),
+					"alignment", proc.Alignment(),
+					"stride", proc.Stride(),
+					"allocSliceSize", proc.AllocSliceSize(),
+					"stagingAreas", proc.StagingAreas())
 			}
-			proc.GetOutput(i, rb.data)
-			recoveryBlocks = append(recoveryBlocks, rb)
+			opts.Logger.Debug("par2go: processing chunk", "chunk", ci+1, "of", len(chunks), "blocks", len(chunk))
+
+			proc.SetRecoverySlices(chunk)
+
+			// Progress: each chunk contributes proportionally to the total.
+			chunkBase := float64(ci) / float64(len(chunks))
+			chunkScale := 1.0 / float64(len(chunks))
+
+			if ci == 0 {
+				// First chunk: single-pass hash+encode (computes hashFull + IFSC).
+				if err := hashAndEncodeFiles(ctx, files, proc, opts.SliceSize, func(pct float64) {
+					report("hashing", chunkBase+pct*chunkScale)
+				}); err != nil {
+					return fmt.Errorf("par2go: hash+encode failed: %w", err)
+				}
+			} else {
+				// Subsequent chunks: re-read files, encode only (no hashing).
+				if err := encodeFiles(ctx, files, proc, opts.SliceSize, func(pct float64) {
+					report("hashing", chunkBase+pct*chunkScale)
+				}); err != nil {
+					return fmt.Errorf("par2go: encode chunk %d failed: %w", ci, err)
+				}
+			}
+
+			proc.End()
+			ended = true
+
+			// Collect this chunk's recovery blocks.
+			for i, exp := range chunk {
+				rb := recoveryBlock{
+					exponent: exp,
+					data:     make([]byte, opts.SliceSize),
+				}
+				proc.GetOutput(i, rb.data)
+				recoveryBlocks = append(recoveryBlocks, rb)
+			}
+			proc.FreeMem()
+			return nil
+		}(); err != nil {
+			return err
 		}
-		proc.FreeMem()
-		proc.Close()
 	}
 
 	report("hashing", 1.0)
