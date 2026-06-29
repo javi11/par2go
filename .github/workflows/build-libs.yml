@@ -70,7 +70,22 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          install: mingw-w64-x86_64-gcc make
+          install: make
+
+      # Pin the MinGW GCC toolchain to a fixed version so the prebuilt static
+      # library stays ABI-compatible with downstream consumers. MSYS2 is a
+      # rolling repo; GCC 16 dropped the emulated-TLS std::call_once symbols
+      # (__emutls_v._ZSt11__once_call / __once_callable) that older libstdc++
+      # emitted, which breaks linking of this lib in consumers. Consumers must
+      # pin to the SAME version (see github.com/javi11/postie CI).
+      - name: Pin MinGW GCC toolchain
+        shell: msys2 {0}
+        run: |
+          GCC_VER=15.2.0-14
+          pacman -U --noconfirm \
+            https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-${GCC_VER}-any.pkg.tar.zst \
+            https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-libs-${GCC_VER}-any.pkg.tar.zst
+          gcc --version
 
       - name: Build
         shell: msys2 {0}
