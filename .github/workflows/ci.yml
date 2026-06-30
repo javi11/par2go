@@ -71,7 +71,22 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          install: mingw-w64-x86_64-gcc
+          install: ''
+
+      # Pin the MinGW GCC toolchain to match the version the prebuilt
+      # libparpar_gf16_windows_amd64.a was built with. GCC 16 dropped the
+      # emulated-TLS std::call_once symbols the archive references, so testing
+      # the cgo bridge against a rolling GCC fails to link. Keep in sync with
+      # build-libs.yml.
+      - name: Pin MinGW GCC toolchain
+        if: matrix.os == 'windows'
+        shell: msys2 {0}
+        run: |
+          GCC_VER=15.2.0-14
+          pacman -U --noconfirm \
+            https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-${GCC_VER}-any.pkg.tar.zst \
+            https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-libs-${GCC_VER}-any.pkg.tar.zst
+          gcc --version
 
       - name: Add MinGW to PATH
         if: matrix.os == 'windows'
