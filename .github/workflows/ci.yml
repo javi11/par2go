@@ -112,6 +112,15 @@ jobs:
         shell: pwsh
         run: Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name
 
+      # Runs before, and separately from, the main suite: a crash inside a
+      # GF16 kernel kills the whole test binary, so this pass isolates each
+      # kernel in its own process and names the one that dies.
+      - name: GF16 kernel matrix
+        continue-on-error: true
+        env:
+          CGO_ENABLED: '1'
+        run: go test -v -count=1 -run '^TestEveryAvailableKernel$' ./internal/parpar/
+
       - name: Test
         env:
           CGO_ENABLED: '1'
