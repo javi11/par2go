@@ -124,7 +124,9 @@ jobs:
       - name: Test
         env:
           CGO_ENABLED: '1'
-        run: go test -v ./...
+        # -count=1: a result cached from a run on a different CPU model must
+        # never stand in for this runner's kernels.
+        run: go test -v -count=1 ./...
 
       # Crashes inside the prebuilt SIMD kernels are intermittent; repeat the
       # encoder tests so a bad kernel shows up here rather than downstream.
@@ -138,4 +140,4 @@ jobs:
         if: matrix.os != 'windows'
         env:
           CGO_ENABLED: '1'
-        run: go test -race ./...
+        run: go test -race -count=1 ./...

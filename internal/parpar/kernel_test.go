@@ -203,3 +203,18 @@ func tail(b []byte, n int) string {
 	}
 	return string(b)
 }
+
+// TestAutoSelectionAvoidsAffineAVX512 pins the bridge's workaround for the
+// Affine (GFNI+AVX512) kernel, which segfaults in the prebuilt libraries on
+// CPUs with GFNI and AVX-512 (Intel Xeon Platinum 8573C, AMD EPYC 9V45).
+// Auto-selection must never hand that kernel to a caller.
+func TestAutoSelectionAvoidsAffineAVX512(t *testing.T) {
+	proc, err := NewGfProc(4096, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proc.Close()
+	if name := proc.MethodName(); name == "Affine (GFNI+AVX512)" {
+		t.Fatalf("auto-selected kernel %q is known to crash; the bridge should have substituted another kernel", name)
+	}
+}
