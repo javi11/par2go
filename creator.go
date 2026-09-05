@@ -45,7 +45,7 @@ type Options struct {
 	// Default 0 means automatic (min of 75% physical RAM or 4 GiB).
 	MemoryLimit int64
 	// Method forces a specific GF16 SIMD method (0 = auto-detect).
-	// Use parpar.GF16Auto, parpar.GF16ShuffleAVX2, parpar.GF16ClmulNEON, etc.
+	// Use the GF16* constants exported by this package (GF16Auto, GF16ShuffleAVX2, GF16ClmulNEON, ...).
 	Method int
 	// InputGrouping controls the input batch size for the GF16 encoder.
 	// 0 means auto-detect (typically ~12). Higher values use more memory
