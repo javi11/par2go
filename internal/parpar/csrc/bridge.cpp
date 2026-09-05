@@ -7,8 +7,10 @@
 #include "vendor/gf16/controller_cpu.h"
 #include "vendor/gf16/gfmat_coeff.h"
 
+#include <algorithm>
 #include <mutex>
 #include <new>
+#include <vector>
 
 // One-time initialization of gfmat coefficient tables.
 // gfmat_init() is normally called by PAR2Proc's constructor; since we bypass
@@ -22,6 +24,26 @@ struct parpar_gfproc {
     PAR2ProcCPU* cpu;
     size_t        sliceSize;
 };
+
+// The Affine (GFNI+AVX512) kernel in the prebuilt libraries segfaults inside
+// the compute workers on CPUs that expose GFNI together with AVX-512BW/VL
+// (seen on Intel Xeon Platinum 8573C and AMD EPYC 9V45). Every other kernel
+// those CPUs can run produces correct output, so when ParPar would pick it
+// on its own, hand it the next-fastest kernel the CPU supports instead. A
+// caller that forces the method explicitly is left alone.
+static Galois16Methods resolve_auto_method() {
+    Galois16Methods method = Galois16Mul::default_method();
+    if (method != GF16_AFFINE_AVX512) return method;
+
+    std::vector<Galois16Methods> avail = Galois16Mul::availableMethods(true);
+    const Galois16Methods preferred[] = {
+        GF16_SHUFFLE_VBMI, GF16_SHUFFLE_AVX512, GF16_SHUFFLE_AVX2, GF16_LOOKUP,
+    };
+    for (Galois16Methods m : preferred) {
+        if (std::find(avail.begin(), avail.end(), m) != avail.end()) return m;
+    }
+    return method;
+}
 
 extern "C" {
 
@@ -53,7 +75,7 @@ parpar_gfproc_t* parpar_gfproc_new(size_t sliceSize, int numThreads,
 
     // init() creates the GF16 multiplier, allocates staging buffers, starts
     // the transfer thread, and launches compute worker threads.
-    Galois16Methods gfMethod = (method > 0) ? (Galois16Methods)method : GF16_AUTO;
+    Galois16Methods gfMethod = (method > 0) ? (Galois16Methods)method : resolve_auto_method();
     if (!proc->cpu->init(gfMethod, inputGrouping, chunkLen)) {
         delete proc->cpu;
         delete proc;

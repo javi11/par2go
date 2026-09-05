@@ -103,10 +103,30 @@ jobs:
           grep -m1 -o 'avx512[a-z_]*\|avx2\|gfni\|vbmi[0-9]*\|sve[0-9]*\|sha3' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
           nproc
 
+      - name: Runner CPU info (macOS)
+        if: matrix.os == 'macos'
+        run: sysctl -n machdep.cpu.brand_string hw.ncpu
+
+      - name: Runner CPU info (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name
+
+      # Runs before, and separately from, the main suite: a crash inside a
+      # GF16 kernel kills the whole test binary, so this pass isolates each
+      # kernel in its own process and names the one that dies.
+      - name: GF16 kernel matrix
+        continue-on-error: true
+        env:
+          CGO_ENABLED: '1'
+        run: go test -v -count=1 -run '^TestEveryAvailableKernel$' ./internal/parpar/
+
       - name: Test
         env:
           CGO_ENABLED: '1'
-        run: go test -v ./...
+        # -count=1: a result cached from a run on a different CPU model must
+        # never stand in for this runner's kernels.
+        run: go test -v -count=1 ./...
 
       # Crashes inside the prebuilt SIMD kernels are intermittent; repeat the
       # encoder tests so a bad kernel shows up here rather than downstream.
@@ -120,4 +140,4 @@ jobs:
         if: matrix.os != 'windows'
         env:
           CGO_ENABLED: '1'
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
