@@ -137,8 +137,8 @@ func TestGfProcQueryMethods(t *testing.T) {
 		t.Errorf("StagingAreas() = %d, want 2 (default)", sa)
 	}
 
-	t.Logf("ChunkLen=%d InputBatchSize=%d Alignment=%d Stride=%d AllocSliceSize=%d StagingAreas=%d",
-		proc.ChunkLen(), proc.InputBatchSize(), proc.Alignment(), proc.Stride(), proc.AllocSliceSize(), proc.StagingAreas())
+	t.Logf("Method=%q Threads=%d ChunkLen=%d InputBatchSize=%d Alignment=%d Stride=%d AllocSliceSize=%d StagingAreas=%d",
+		proc.MethodName(), proc.NumThreads(), proc.ChunkLen(), proc.InputBatchSize(), proc.Alignment(), proc.Stride(), proc.AllocSliceSize(), proc.StagingAreas())
 }
 
 func TestGfProcWithConfig(t *testing.T) {

@@ -93,10 +93,28 @@ jobs:
         shell: pwsh
         run: echo "$env:RUNNER_TEMP\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
+      # ParPar picks its GF16 kernel from the runner CPU, and GitHub's
+      # ubuntu-latest pool mixes Intel (AVX-512/GFNI) and AMD (AVX2) hosts.
+      # Record which one we got so a native crash can be tied to a kernel.
+      - name: Runner CPU info
+        if: matrix.os == 'linux'
+        run: |
+          grep -m1 'model name' /proc/cpuinfo || true
+          grep -m1 -o 'avx512[a-z_]*\|avx2\|gfni\|vbmi[0-9]*\|sve[0-9]*\|sha3' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          nproc
+
       - name: Test
         env:
           CGO_ENABLED: '1'
         run: go test -v ./...
+
+      # Crashes inside the prebuilt SIMD kernels are intermittent; repeat the
+      # encoder tests so a bad kernel shows up here rather than downstream.
+      - name: Stress encoder
+        if: matrix.os == 'linux'
+        env:
+          CGO_ENABLED: '1'
+        run: go test -count=10 -run 'TestGfProc|TestCreate' ./...
 
       - name: Test with race detector
         if: matrix.os != 'windows'
