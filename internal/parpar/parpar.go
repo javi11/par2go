@@ -18,6 +18,7 @@ import "C"
 
 import (
 	"runtime"
+	"sync"
 	"unsafe"
 )
 
@@ -77,6 +78,10 @@ const (
 //	proc.Close()
 type GfProc struct {
 	handle *C.parpar_gfproc_t
+	// PAR2ProcCPU is single-caller by design: canAdd/waitForAdd/addInput
+	// mutate the staging cursor without any locking, so every entry point
+	// into the C++ object must be serialized here.
+	mu sync.Mutex
 }
 
 // GfProcConfig configures a GfProc instance with full control over all
@@ -149,6 +154,8 @@ func NewGfProcWithConfig(cfg GfProcConfig) (*GfProc, error) {
 // standard PAR2 uses {0, 1, 2, ..., numRecovery-1}.
 // Must be called before the first Add.
 func (g *GfProc) SetRecoverySlices(exponents []uint16) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if len(exponents) == 0 {
 		C.parpar_gfproc_set_recovery_slices(g.handle, nil, 0)
 		return
@@ -167,6 +174,8 @@ func (g *GfProc) Add(sliceNum int, data []byte) AddResult {
 	if len(data) == 0 {
 		return AddOK
 	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	r := C.parpar_gfproc_add(
 		g.handle,
 		C.uint(sliceNum),
@@ -179,6 +188,8 @@ func (g *GfProc) Add(sliceNum int, data []byte) AddResult {
 // End signals that all inputs have been added and blocks until all compute
 // worker threads have finished. Call before GetOutput.
 func (g *GfProc) End() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	C.parpar_gfproc_end(g.handle)
 }
 
@@ -189,6 +200,8 @@ func (g *GfProc) GetOutput(recoveryIdx int, dst []byte) {
 	if len(dst) == 0 {
 		return
 	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	C.parpar_gfproc_get_output(
 		g.handle,
 		C.uint(recoveryIdx),
@@ -200,6 +213,8 @@ func (g *GfProc) GetOutput(recoveryIdx int, dst []byte) {
 // FreeMem releases the internal processing (output) buffer.
 // Call after all outputs have been retrieved to reclaim memory.
 func (g *GfProc) FreeMem() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	C.parpar_gfproc_free_mem(g.handle)
 }
 
@@ -246,6 +261,8 @@ func (g *GfProc) StagingAreas() int {
 
 // Close frees all C++ resources. After Close the GfProc must not be used.
 func (g *GfProc) Close() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.handle != nil {
 		C.parpar_gfproc_free(g.handle)
 		g.handle = nil
