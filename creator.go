@@ -546,6 +546,15 @@ func hashAndEncodeFiles(
 	var readerWg sync.WaitGroup
 	var doneSlices atomic.Int64
 
+	// fullHashWork carries one read slice from a file's reader goroutine to
+	// that file's full-hash goroutine. n is the number of real file bytes in
+	// the (zero-padded) buffer.
+	type fullHashWork struct {
+		bptr     *[]byte
+		n        int
+		sliceIdx int
+	}
+
 	for i := range files {
 		readerWg.Add(1)
 		go func(i int) {
@@ -555,8 +564,37 @@ func hashAndEncodeFiles(
 
 			fi := &files[i]
 			f := openFiles[i]
-			hashFull := md5.New()
 			sliceIdx := 0
+
+			// The whole-file MD5 must consume slices in order, so it runs on
+			// one dedicated goroutine per file. Keeping it off the reader
+			// goroutine lets the next read and the GF16 feed (proc.Add)
+			// proceed while the previous slice is being hashed, instead of
+			// serialising read → MD5 → Add on a single goroutine. The
+			// channel depth bounds how many slices can be in flight per file.
+			fullCh := make(chan fullHashWork, 2)
+			var fullWg sync.WaitGroup
+			fullWg.Add(1)
+			go func() {
+				defer fullWg.Done()
+				hashFull := md5.New()
+				for w := range fullCh {
+					hashFull.Write((*w.bptr)[:w.n])
+					// Hand the (still padded) buffer to the IFSC hash pool,
+					// which owns it until it is returned to bufPool.
+					hw := hashWork{bptr: w.bptr, fileIdx: i, sliceIdx: w.sliceIdx}
+					select {
+					case hashCh <- hw:
+					case <-ctx.Done():
+						bufPool.Put(w.bptr)
+					}
+				}
+				copy(fi.hashFull[:], hashFull.Sum(nil))
+			}()
+			defer func() {
+				close(fullCh)
+				fullWg.Wait()
+			}()
 
 			for {
 				if err := ctx.Err(); err != nil {
@@ -581,9 +619,6 @@ func hashAndEncodeFiles(
 					return
 				}
 
-				// Hash only actual file bytes (not zero-padding).
-				hashFull.Write(buf[:n])
-
 				// Zero-pad last partial slice for encoding and IFSC.
 				if n < sliceSize {
 					clear(buf[n:])
@@ -593,11 +628,10 @@ func hashAndEncodeFiles(
 				// proc.Add is concurrency-safe across goroutines.
 				proc.Add(offsets[i]+sliceIdx, buf)
 
-				// Delegate per-slice IFSC hashing to the hash pool.
-				// The buffer is still valid; hash workers own it until they put it back.
-				hw := hashWork{bptr: bptr, fileIdx: i, sliceIdx: sliceIdx}
+				// Hand off to the per-file full-hash goroutine, which then
+				// forwards the buffer to the IFSC pool.
 				select {
-				case hashCh <- hw:
+				case fullCh <- fullHashWork{bptr: bptr, n: n, sliceIdx: sliceIdx}:
 				case <-ctx.Done():
 					bufPool.Put(bptr)
 					readerMu.Lock()
@@ -614,8 +648,6 @@ func hashAndEncodeFiles(
 					break
 				}
 			}
-
-			copy(fi.hashFull[:], hashFull.Sum(nil))
 		}(i)
 	}
 
